@@ -28751,7 +28751,7 @@ UsingSkillWatcher.setRules({
 		fhb = true,
 		onStart = function(def)
 			trackHitboxWindow(def, "ComboBlitz", UsingSkillWatcher.rules.ComboBlitz, 0, 2.0, 0.05, function()
-				blockFor(2.4)
+				blockFor(2.8)
 			end)
 		end,
 	},
