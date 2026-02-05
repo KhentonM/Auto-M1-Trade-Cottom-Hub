@@ -4869,6 +4869,287 @@ local function matchSkill(lowerValue, compactValue, token, spacedToken)
 	return compactValue:find(token, 1, true) ~= nil
 end
 
+local function jumpTwice()
+	InputClient.jump()
+	task.delay(0.08, function()
+		InputClient.jump()
+	end)
+end
+
+local function blockFor(seconds)
+	if seconds and seconds > 0 then
+		InputClient.blockHoldSeconds(seconds)
+	end
+end
+
+local function dash(dir)
+	InputClient.dash(dir)
+end
+
+local function dashAfter(seconds, dir, withJump)
+	local delaySeconds = seconds or 0
+	if delaySeconds <= 0 then
+		if withJump then
+			jumpTwice()
+		end
+		return dash(dir)
+	end
+	task.delay(delaySeconds, function()
+		if withJump then
+			jumpTwice()
+		end
+		dash(dir)
+	end)
+end
+
+local function blockAfter(seconds, duration)
+	local delaySeconds = seconds or 0
+	if delaySeconds <= 0 then
+		return blockFor(duration)
+	end
+	task.delay(delaySeconds, function()
+		blockFor(duration)
+	end)
+end
+
+local localSkillEndRules = {}
+
+local function addSkillRule(token, spacedToken, onEnd)
+	localSkillEndRules[#localSkillEndRules + 1] = {
+		token = token,
+		spacedToken = spacedToken,
+		onEnd = onEnd,
+	}
+end
+
+local function addAssetRule(id, onEnd)
+	local token = "rbxassetid://" .. tostring(id)
+	addSkillRule(token, nil, onEnd)
+	addSkillRule(tostring(id), nil, onEnd)
+end
+
+addSkillRule("uzumakibarrage", "uzumaki barrage", function()
+	blockFor(0.3)
+end)
+addSkillRule("shadowclone", "shadow clone", function()
+	blockFor(0.8)
+end)
+addSkillRule("clonethrow", "clone throw", function()
+	blockFor(1.2)
+end)
+addSkillRule("fireballjutsu", "fireball jutsu", function(_, _, _, duration)
+	if duration and duration >= 2.0 then
+		blockFor(3)
+	else
+		dashAfter(0.65, "right")
+	end
+end)
+addSkillRule("chidori", nil, function()
+	dash("back")
+end)
+addSkillRule("fumashuriken", "fuma shuriken", function()
+	blockFor(1.2)
+end)
+addSkillRule("lionsbarrage", "lion's barrage", function()
+	blockFor(0.8)
+end)
+addSkillRule("headhunterjutsu", "headhunter jutsu", function()
+	blockFor(0.8)
+end)
+addSkillRule("kunai", nil, function()
+	blockFor(1.1)
+end)
+addSkillRule("primarylotus", "primary lotus", function()
+	blockFor(0.6)
+end)
+addSkillRule("shuriken", nil, function()
+	blockFor(0.5)
+end)
+addSkillRule("leafhurricane", "leaf hurricane", function()
+	blockFor(0.8)
+end)
+addSkillRule("risingwind", "rising wind", function()
+	dash("back")
+end)
+addSkillRule("rotation", nil, function()
+	dash("back")
+end)
+addSkillRule("explosivekunai", "explosive kunai", function()
+	blockFor(0.8)
+end)
+addSkillRule("64palms", "64 palms", function()
+	blockFor(6)
+end)
+addSkillRule("airpalm", "air palm", function()
+	blockFor(0.7)
+end)
+addSkillRule("waterclone", "water clone", function()
+	blockFor(1.2)
+end)
+addSkillRule("decapitate", nil, function()
+	task.delay(0.6, function()
+		jumpTwice()
+		dash("back")
+	end)
+end)
+addSkillRule("swordthrow", "sword throw", function()
+	blockFor(0.5)
+end)
+addSkillRule("sandcoffin", "sand coffin", function()
+	blockFor(0.3)
+end)
+addSkillRule("sandtsunami", "sand tsunami", function()
+	jumpTwice()
+	dash("right")
+end)
+addSkillRule("sandspikes", "sand spikes", function()
+	blockFor(1.2)
+end)
+addSkillRule("chidoristream", "chidori stream", function()
+	blockFor(1.1)
+end)
+addSkillRule("chidorisenbon", "chidori senbon", function()
+	blockFor(0.75)
+end)
+addSkillRule("chidoritruespear", "chidori true spear", function()
+	jumpTwice()
+	dash("right")
+end)
+addSkillRule("rasengancombo", "rasengan combo", function()
+	blockFor(0.3)
+end)
+addSkillRule("shadowclones", "shadow clones", function()
+	blockFor(0.9)
+end)
+addSkillRule("rasenganthrow", "rasengan throw", function()
+	task.delay(0.7, function()
+		jumpTwice()
+		dash("right")
+	end)
+end)
+addSkillRule("shurikenassualt", "shuriken assualt", function()
+	blockFor(0.8)
+end)
+addSkillRule("demonicillusion", "demonic illusion", function()
+	blockFor(0.65)
+end)
+addSkillRule("asurapath", "asura path", function()
+	blockAfter(0.3, 0.75)
+end)
+addSkillRule("sixpathscombo", "six paths combo", function()
+	blockFor(1.1)
+end)
+addSkillRule("almightypush", "almighty push", function(_, _, _, duration)
+	if duration and duration > 1.5 then
+		dash("back")
+	else
+		blockFor(1.2)
+	end
+end)
+addSkillRule("universalpull", "universal pull", function()
+	blockFor(0.8)
+end)
+addSkillRule("nunchaku", nil, function()
+	blockFor(6)
+end)
+addSkillRule("severehurricane", "severe hurricane", function()
+	task.delay(0.19, function()
+		jumpTwice()
+		dash("right")
+	end)
+end)
+addSkillRule("dynamicentry", "dynamic entry", function()
+	blockFor(1.5)
+end)
+addSkillRule("flipkick", "flip kick", function()
+	blockAfter(0.4, 0.9)
+end)
+addSkillRule("vicegrip", "vice grip", function()
+	blockFor(1.1)
+end)
+addSkillRule("ligerbomb", "liger bomb", function()
+	blockFor(0.4)
+end)
+addSkillRule("sharkbombjutsu", "shark bomb jutsu", function()
+	task.delay(0.5, function()
+		dash("right")
+	end)
+end)
+addSkillRule("waterprison", "water prison", function()
+	blockAfter(0.7, 0.4)
+end)
+addSkillRule("samehadafeast", "samehada feast", function()
+	jumpTwice()
+	dash("back")
+end)
+
+addAssetRule(3240243801, function()
+	blockFor(0.3)
+end)
+addAssetRule(3240242879, function()
+	blockFor(0.3)
+end)
+addAssetRule(3240241715, function()
+	blockFor(0.3)
+end)
+addAssetRule(3240240417, function()
+	blockFor(0.3)
+end)
+addAssetRule(3240245051, function()
+	dash("back")
+end)
+addAssetRule(3263871265, function()
+	blockFor(0.3)
+end)
+addAssetRule(3263870104, function()
+	blockFor(0.3)
+end)
+addAssetRule(3263925841, function()
+	dash("back")
+end)
+addAssetRule(12831969898, function()
+	dashAfter(0.2, "right")
+end)
+addAssetRule(14437150122, function()
+	blockFor(0.3)
+end)
+addAssetRule(14437148019, function()
+	blockFor(0.3)
+end)
+addAssetRule(14437145085, function()
+	blockFor(0.3)
+end)
+addAssetRule(14436312737, function()
+	blockFor(0.3)
+end)
+addAssetRule(14437152064, function()
+	dash("back")
+end)
+
+local function handleLocalSkillEnd(rawValue, durationSeconds)
+	if type(rawValue) ~= "string" or rawValue == "" then
+		return
+	end
+	local lowerValue, compactValue = normalizeSkillValue(rawValue)
+	local bestRule = nil
+	local bestLen = -1
+	for _, rule in ipairs(localSkillEndRules) do
+		if rule and rule.token and matchSkill(lowerValue, compactValue, rule.token, rule.spacedToken) then
+			local len = #tostring(rule.token)
+			if rule.spacedToken and #rule.spacedToken > len then
+				len = #rule.spacedToken
+			end
+			if len > bestLen then
+				bestLen = len
+				bestRule = rule
+			end
+		end
+	end
+	if bestRule and type(bestRule.onEnd) == "function" then
+		bestRule.onEnd(nil, lowerValue, compactValue, durationSeconds)
+	end
+end
+
 local function deferHitboxAction(def, key, rule, delaySeconds, callback)
 	local delay = delaySeconds or 0
 	local info = def.stateInfo and def.stateInfo[key]
@@ -4936,6 +5217,9 @@ local function logUsingSkill(def, rawValue, isLocal)
 			end
 			if Library and Library.AddUsingSkillEntry then
 				Library:AddUsingSkillEntry(playerName, previousValue, isLocal, "End", duration)
+			end
+			if isLocal then
+				handleLocalSkillEnd(previousValue, duration)
 			end
 			def.lastSkillEntry = nil
 			def.lastSkillUpdateAt = nil
