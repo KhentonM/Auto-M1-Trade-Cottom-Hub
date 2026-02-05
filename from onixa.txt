@@ -6126,6 +6126,7 @@ local AutoCombo = {}
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
 
 local Configuration = require("Utility/Configuration")
 local Logger = require("Utility/Logger")
@@ -6135,6 +6136,47 @@ local Deserializer = require("Utility/Deserializer")
 local InputClient = require("Game/InputClient")
 local Targeting = require("Features/Combat/Targeting")
 local TaskSpawner = require("Utility/TaskSpawner")
+
+local MOVE_BLOCK_ACTION = "AutoCombo_BlockMove"
+local moveBlockActive = false
+
+local function setMoveBlock(enabled)
+	if not ContextActionService then
+		return
+	end
+	if enabled then
+		if moveBlockActive then
+			return
+		end
+		moveBlockActive = true
+		pcall(function()
+			ContextActionService:BindActionAtPriority(
+				MOVE_BLOCK_ACTION,
+				function()
+					return Enum.ContextActionResult.Sink
+				end,
+				false,
+				Enum.ContextActionPriority.High.Value,
+				Enum.KeyCode.W,
+				Enum.KeyCode.A,
+				Enum.KeyCode.S,
+				Enum.KeyCode.D,
+				Enum.KeyCode.Up,
+				Enum.KeyCode.Down,
+				Enum.KeyCode.Left,
+				Enum.KeyCode.Right
+			)
+		end)
+	else
+		if not moveBlockActive then
+			return
+		end
+		moveBlockActive = false
+		pcall(function()
+			ContextActionService:UnbindAction(MOVE_BLOCK_ACTION)
+		end)
+	end
+end
 
 local fs = Filesystem.new("CottomHub-AutoCombos")
 local comboState = {
@@ -6767,11 +6809,30 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 		return
 	end
 
+	local movementLocked = false
+	local function lockMovement()
+		if movementLocked then
+			return
+		end
+		movementLocked = true
+		setMoveBlock(true)
+	end
+	local function unlockMovement()
+		if not movementLocked then
+			return
+		end
+		movementLocked = false
+		setMoveBlock(false)
+	end
+
+	lockMovement()
+
 	local start = os.clock()
 	local lastSprint = 0
 	local lastPos = target and target.root and target.root.Position or nil
 	while os.clock() - start <= duration do
 		if not isRunning(token) then
+			unlockMovement()
 			return
 		end
 		if target and isTargetValid(target) then
@@ -6786,15 +6847,22 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 				if Configuration.expectToggleValue("AutoComboLockTarget") and state.lockedTarget then
 					AutoCombo.stop()
 				end
+				unlockMovement()
 				return
 			end
 		end
 		if lastPos then
-			local dist = (lastPos - localRoot.Position).Magnitude
+			local toDest = lastPos - localRoot.Position
+			local flat = Vector3.new(toDest.X, 0, toDest.Z)
+			local dist = flat.Magnitude
 			if stopDistance > 0 and dist <= stopDistance then
 				break
 			end
-			humanoid:MoveTo(lastPos)
+			if dist > 1e-3 then
+				humanoid:Move(flat.Unit, false)
+			else
+				humanoid:Move(Vector3.zero, false)
+			end
 		end
 		if useSprint and sprintHold > 0 then
 			local now = os.clock()
@@ -6808,9 +6876,7 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	pcall(function()
 		humanoid:Move(Vector3.zero, false)
 	end)
-	pcall(function()
-		humanoid:MoveTo(localRoot.Position)
-	end)
+	unlockMovement()
 end)
 
 local function executeStep(step, token, state)
