@@ -28773,7 +28773,7 @@ UsingSkillWatcher.setRules({
 		ihbc = true,
 		fhb = true,
 		onStart = function()
-			blockFor(1.6)
+			blockFor(1.9)
 		end,
 	},
 	HellzoneGrenade = {
