@@ -954,6 +954,9 @@ AnimatorDefender.process = LPH_NO_VIRTUALIZE(function(self, track)
 	---@type AnimationTiming?
 	local timing = self:initial(self.entity, SaveManager.as, self.entity.Name, aid)
 	if not timing then
+		if isLocal then
+			M1AutoTrade.handleLocalM1(nil, track)
+		end
 		return
 	end
 
@@ -971,6 +974,7 @@ AnimatorDefender.process = LPH_NO_VIRTUALIZE(function(self, track)
 	end
 
 	if isLocal then
+		M1AutoTrade.handleLocalM1(timing, track)
 		return
 	end
 
@@ -5494,10 +5498,214 @@ local workspaceService = game:GetService("Workspace")
 local Configuration = require("Utility/Configuration")
 local InputClient = require("Game/InputClient")
 local Table = require("Utility/Table")
+local AutoCombo = require("Features/Combat/AutoCombo")
+local Logger = require("Utility/Logger")
 
 local lastTradeAt = {}
 local TRADE_COOLDOWN = 0.15
 local METERS_TO_STUDS = 3.57
+local lastHitObj = nil
+local lastHitConn = nil
+local lastHitDescConn = nil
+local lastHitAt = 0
+local lastHitTarget = nil
+local localM1WindowStart = 0
+local localM1WindowUntil = 0
+local localM1Token = 0
+local LOCAL_M1_RANGE_STUDS = 15
+local localInitDone = false
+local clearingLastHit = false
+
+local function safeLower(value)
+	local lowerFn = string and string.lower
+	if lowerFn then
+		return lowerFn(tostring(value or ""))
+	end
+	return tostring(value or "")
+end
+
+local function isLikelyM1Name(name)
+	local lowered = safeLower(name)
+	if lowered == "" then
+		return false
+	end
+	if lowered == "m1" then
+		return true
+	end
+	if lowered:find("m1_")
+		or lowered:find("_m1")
+		or lowered:find(" m1")
+		or lowered:find("m1 ")
+		or lowered:find("-m1")
+		or lowered:find("m1-")
+	then
+		return true
+	end
+	if lowered:find("light") or lowered:find("basic") or lowered:find("jab") then
+		return true
+	end
+	return false
+end
+
+local function isLocalUsingSkill()
+	local localCharacter = Players.LocalPlayer and Players.LocalPlayer.Character
+	if not localCharacter then
+		return false
+	end
+	local state = localCharacter:GetAttribute("CurrentState")
+	if state == "Skill" then
+		return true
+	end
+	local skillValue = localCharacter:FindFirstChild("UsingSkill", true)
+	if skillValue and skillValue:IsA("ValueBase") then
+		local raw = skillValue.Value
+		if type(raw) == "string" then
+			local value = safeLower(raw)
+			if value ~= "" and value ~= "none" and value ~= "idle" then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function resolveLastHit(character)
+	if not character then
+		return nil
+	end
+	local direct = character:FindFirstChild("LastHit")
+	if direct and direct:IsA("ValueBase") then
+		return direct
+	end
+	local descendant = character:FindFirstChild("LastHit", true)
+	if descendant and descendant:IsA("ValueBase") then
+		return descendant
+	end
+	return nil
+end
+
+local clearValueBase
+local listCloseTargets
+
+clearValueBase = function(valueObj)
+	if not valueObj or not valueObj:IsA("ValueBase") then
+		return
+	end
+	pcall(function()
+		if valueObj:IsA("ObjectValue") then
+			valueObj.Value = nil
+		elseif valueObj:IsA("StringValue") then
+			valueObj.Value = ""
+		elseif valueObj:IsA("BoolValue") then
+			valueObj.Value = false
+		elseif valueObj:IsA("NumberValue") or valueObj:IsA("IntValue") then
+			valueObj.Value = 0
+		else
+			valueObj.Value = nil
+		end
+	end)
+end
+
+local function startComboIfReady()
+	if not Configuration.expectToggleValue("EnableAutoCombo") then
+		return false
+	end
+	if not Configuration.expectToggleValue("AutoComboOnM1Hit") then
+		return false
+	end
+	if AutoCombo and AutoCombo.isRunning and AutoCombo.isRunning() then
+		return false
+	end
+	if isLocalUsingSkill() then
+		return false
+	end
+	local profileName = Configuration.expectOptionValue("AutoComboProfile") or ""
+	if profileName == "" then
+		if Logger and Logger.longNotify then
+			Logger.longNotify("Please select an Auto-Combo profile.")
+		end
+		return false
+	end
+	AutoCombo.run(profileName)
+	return true
+end
+
+local function openLocalM1Window()
+	if not Configuration.expectToggleValue("EnableAutoCombo") then
+		return
+	end
+	if not Configuration.expectToggleValue("AutoComboOnM1Hit") then
+		return
+	end
+	if AutoCombo and AutoCombo.isRunning and AutoCombo.isRunning() then
+		return
+	end
+	if isLocalUsingSkill() then
+		return
+	end
+	local holdMs = Configuration.expectOptionValue("AutoComboOnM1HoldMs") or 250
+	local holdSeconds = math.max(holdMs, 10) / 1000
+	local now = os.clock()
+	localM1WindowStart = now
+	localM1WindowUntil = now + holdSeconds
+	local targets = listCloseTargets(LOCAL_M1_RANGE_STUDS)
+	if #targets == 0 then
+		return
+	end
+	local snapshot = {}
+	for _, target in ipairs(targets) do
+		snapshot[target.character] = target.humanoid.Health
+	end
+	localM1Token = localM1Token + 1
+	local token = localM1Token
+	local deadline = localM1WindowUntil
+	task.spawn(function()
+		while os.clock() <= deadline do
+			if token ~= localM1Token then
+				return
+			end
+			if AutoCombo and AutoCombo.isRunning and AutoCombo.isRunning() then
+				return
+			end
+			if isLocalUsingSkill() then
+				return
+			end
+			for _, target in ipairs(listCloseTargets(LOCAL_M1_RANGE_STUDS)) do
+				local prev = snapshot[target.character]
+				if prev and target.humanoid.Health < prev then
+					startComboIfReady()
+					return
+				end
+			end
+			task.wait(0.03)
+		end
+	end)
+end
+
+local function handleLastHitChanged()
+	if clearingLastHit then
+		return
+	end
+	local obj = lastHitObj
+	if not obj then
+		return
+	end
+	local raw = nil
+	local ok = pcall(function()
+		raw = obj.Value
+	end)
+	if not ok then
+		return
+	end
+	if raw == nil or raw == "" then
+		return
+	end
+	lastHitTarget = raw
+	lastHitAt = os.clock()
+	clearingLastHit = true
+	clearValueBase(obj)
+	clearingLastHit = false
+end
 
 local function isM1Block03(timing)
 	if not timing or timing.tag ~= "M1" then
@@ -5529,6 +5737,52 @@ local function isAlly(player)
 		return false
 	end
 	return status == Enum.FriendStatus.Friend
+end
+
+listCloseTargets = function(maxDistanceStuds)
+	local ents = workspaceService:FindFirstChild("Live")
+	if not ents then
+		return {}
+	end
+	local localCharacter = Players.LocalPlayer and Players.LocalPlayer.Character
+	if not localCharacter then
+		return {}
+	end
+	local localRootPart = localCharacter:FindFirstChild("HumanoidRootPart") or localCharacter:FindFirstChild("Torso")
+	if not localRootPart then
+		return {}
+	end
+	local targets = {}
+	for _, entity in next, ents:GetChildren() do
+		if entity == localCharacter then
+			continue
+		end
+		local playerFromCharacter = Players:GetPlayerFromCharacter(entity)
+		if playerFromCharacter and Configuration.expectToggleValue("IgnorePlayers") then
+			continue
+		end
+		if playerFromCharacter and isAlly(playerFromCharacter) and Configuration.expectToggleValue("IgnoreAllies") then
+			continue
+		end
+		local humanoid = entity:FindFirstChildWhichIsA("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then
+			continue
+		end
+		local rootPart = entity:FindFirstChild("HumanoidRootPart") or entity:FindFirstChild("Torso")
+		if not rootPart then
+			continue
+		end
+		local distance = (rootPart.Position - localRootPart.Position).Magnitude
+		if distance <= maxDistanceStuds then
+			targets[#targets + 1] = {
+				character = entity,
+				humanoid = humanoid,
+				root = rootPart,
+				distance = distance,
+			}
+		end
+	end
+	return targets
 end
 
 local function bestTargets()
@@ -5713,6 +5967,153 @@ function M1AutoTrade.handleEntity(timing, entity, distance)
 	doM1Trade()
 end
 
+function M1AutoTrade.handleLocalM1(timing, track)
+	local isM1 = timing and timing.tag == "M1"
+	if not isM1 and not timing and track then
+		if isLikelyM1Name(track.Name) then
+			isM1 = true
+		else
+			local anim = track.Animation
+			if anim and isLikelyM1Name(anim.Name) then
+				isM1 = true
+			else
+				local aid = (anim and anim.AnimationId) or track.AnimationId
+				if isLikelyM1Name(aid) then
+					isM1 = true
+				end
+			end
+		end
+	end
+	if not isM1 then
+		return
+	end
+	openLocalM1Window()
+end
+
+function M1AutoTrade.init()
+	if localInitDone then
+		return
+	end
+	localInitDone = true
+	local localPlayer = Players.LocalPlayer
+	if not localPlayer then
+		Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+		localPlayer = Players.LocalPlayer
+	end
+	local liveChildConn = nil
+
+	local function detachLastHit()
+		if lastHitConn then
+			lastHitConn:Disconnect()
+			lastHitConn = nil
+		end
+		if lastHitDescConn then
+			lastHitDescConn:Disconnect()
+			lastHitDescConn = nil
+		end
+		lastHitObj = nil
+		lastHitAt = 0
+		lastHitTarget = nil
+		localM1WindowStart = 0
+		localM1WindowUntil = 0
+	end
+
+	local function attachLastHit(character)
+		detachLastHit()
+		if not character then
+			return
+		end
+		local hit = resolveLastHit(character)
+		if not hit then
+			local live = workspaceService:FindFirstChild("Live")
+			local liveChar = live and localPlayer and live:FindFirstChild(localPlayer.Name)
+			if liveChar and liveChar ~= character then
+				hit = resolveLastHit(liveChar)
+				if hit then
+					character = liveChar
+				end
+			end
+		end
+		if hit then
+			lastHitObj = hit
+			if hit.GetPropertyChangedSignal then
+				lastHitConn = hit:GetPropertyChangedSignal("Value"):Connect(handleLastHitChanged)
+			else
+				lastHitConn = hit.Changed:Connect(handleLastHitChanged)
+			end
+		end
+		lastHitDescConn = character.DescendantAdded:Connect(function(desc)
+			if lastHitObj then
+				return
+			end
+			if desc.Name == "LastHit" and desc:IsA("ValueBase") then
+				lastHitObj = desc
+				if desc.GetPropertyChangedSignal then
+					lastHitConn = desc:GetPropertyChangedSignal("Value"):Connect(handleLastHitChanged)
+				else
+					lastHitConn = desc.Changed:Connect(handleLastHitChanged)
+				end
+			end
+		end)
+	end
+
+	local function watchLive(live)
+		if liveChildConn then
+			liveChildConn:Disconnect()
+			liveChildConn = nil
+		end
+		if not live then
+			return
+		end
+		liveChildConn = live.ChildAdded:Connect(function(child)
+			if not localPlayer or not child then
+				return
+			end
+			if child.Name == localPlayer.Name then
+				attachLastHit(child)
+			end
+		end)
+		local existing = live:FindFirstChild(localPlayer.Name)
+		if existing and not lastHitObj then
+			attachLastHit(existing)
+		end
+	end
+
+	localPlayer.CharacterAdded:Connect(attachLastHit)
+	localPlayer.CharacterRemoving:Connect(function()
+		detachLastHit()
+	end)
+	if localPlayer.Character then
+		attachLastHit(localPlayer.Character)
+	end
+	watchLive(workspaceService:FindFirstChild("Live"))
+	workspaceService.ChildAdded:Connect(function(child)
+		if child and child.Name == "Live" then
+			watchLive(child)
+		end
+	end)
+	workspaceService.ChildRemoved:Connect(function(child)
+		if child and child.Name == "Live" then
+			if liveChildConn then
+				liveChildConn:Disconnect()
+				liveChildConn = nil
+			end
+		end
+	end)
+	userInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			openLocalM1Window()
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == Enum.KeyCode.ButtonR2 then
+			openLocalM1Window()
+		end
+	end)
+end
+
 return M1AutoTrade
 
 end)
@@ -5724,6 +6125,7 @@ local AutoCombo = {}
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
 local Configuration = require("Utility/Configuration")
 local Logger = require("Utility/Logger")
@@ -5742,8 +6144,6 @@ local comboState = {
 	lockedTarget = nil,
 	lastTarget = nil,
 }
-
-local DEFAULT_MOVE_MAX_DISTANCE = 60
 
 local function sanitizeName(name)
 	name = tostring(name or "")
@@ -5816,14 +6216,41 @@ local function coerceStep(step)
 		out.jumpHoldMs = safeNumber(step.jumpHoldMs, optionValue("AutoComboUptiltJumpHoldMs", 120))
 		out.m1HoldMs = safeNumber(step.m1HoldMs, optionValue("AutoComboUptiltM1HoldMs", 60))
 		out.delayBeforeM1Ms = safeNumber(step.delayBeforeM1Ms, 30)
+	elseif stype == "Upfling" then
+		out.jumpHoldMs = math.max(0, safeNumber(step.jumpHoldMs, 400))
+		out.m1HoldMs = math.max(10, safeNumber(step.m1HoldMs, 230))
+	elseif stype == "JumpHold" then
+		out.holdMs = math.max(0, safeNumber(step.holdMs, 400))
+	elseif stype == "Jump" then
+		out.count = math.max(1, safeNumber(step.count, 1))
+		out.holdMs = math.max(10, safeNumber(step.holdMs, 50))
+		out.gapMs = math.max(0, safeNumber(step.gapMs, 120))
 	elseif stype == "TweenToHead" then
 		out.maxDistance = safeNumber(step.maxDistance, optionValue("AutoComboTweenMaxDistance", 15))
-		out.tweenTime = safeNumber(step.tweenTime, optionValue("AutoComboTweenTime", 0.25))
+		local durationSeconds = tonumber(step.durationSeconds or step.duration or step.tweenDuration)
+		if durationSeconds and durationSeconds > 0 then
+			out.durationSeconds = durationSeconds
+		end
+		out.alignFeet = step.alignFeet == true
+		local speed = tonumber(step.speed)
+		if not speed then
+			local legacyTime = tonumber(step.tweenTime)
+			if legacyTime and legacyTime > 0 and out.maxDistance and out.maxDistance > 0 then
+				speed = out.maxDistance / legacyTime
+			end
+		end
+		out.speed = safeNumber(speed, optionValue("AutoComboTweenSpeed", 60))
 		out.offset = normalizeOffset(step.offset)
 	elseif stype == "MoveToTarget" then
-		out.maxDistance = safeNumber(step.maxDistance, DEFAULT_MOVE_MAX_DISTANCE)
+		local duration = tonumber(step.durationSeconds)
+		if not duration then
+			local legacyTimeout = tonumber(step.timeoutMs)
+			if legacyTimeout then
+				duration = legacyTimeout / 1000
+			end
+		end
+		out.durationSeconds = safeNumber(duration, optionValue("AutoComboMoveToDurationSeconds", 1.2))
 		out.stopDistance = safeNumber(step.stopDistance, optionValue("AutoComboMoveToStopDistance", 4))
-		out.timeoutMs = safeNumber(step.timeoutMs, optionValue("AutoComboMoveToTimeoutMs", 1200))
 		out.useSprint = step.useSprint == true
 	elseif stype == "Dash" then
 		local dir = tostring(step.dir or "right")
@@ -5831,7 +6258,14 @@ local function coerceStep(step)
 			dir = "right"
 		end
 		out.dir = dir
+	elseif stype == "CameraPitch" then
+		out.pitchDegrees = safeNumber(step.pitchDegrees, -45)
+		out.durationMs = math.max(0, safeNumber(step.durationMs, 0))
+		out.holdMs = math.max(0, safeNumber(step.holdMs, 0))
+		out.resetMs = math.max(0, safeNumber(step.resetMs, 0))
 	end
+
+	out.parallel = step.parallel == true
 
 	if step.delayAfterMs ~= nil then
 		out.delayAfterMs = safeNumber(step.delayAfterMs, 0)
@@ -5943,6 +6377,10 @@ function AutoCombo.stop()
 	comboState.lastTarget = nil
 end
 
+function AutoCombo.isRunning()
+	return comboState.running == true
+end
+
 local function isRunning(token)
 	return comboState.running and token == comboState.token
 end
@@ -5981,6 +6419,28 @@ local function resolveTarget(state)
 		return state.lastTarget
 	end
 	return state.lastTarget
+end
+
+local function ensureTargetAlive(state)
+	if not Configuration.expectToggleValue("AutoComboLockTarget") then
+		return true
+	end
+	if not state.lockedTarget then
+		if Configuration.expectToggleValue("AutoComboRetargetOnInvalid") then
+			state.lockedTarget = selectTarget()
+		end
+		return true
+	end
+	if not isTargetValid(state.lockedTarget) then
+		if Configuration.expectToggleValue("AutoComboRetargetOnInvalid") then
+			state.lockedTarget = selectTarget()
+		end
+		if state.lockedTarget and not isTargetValid(state.lockedTarget) then
+			AutoCombo.stop()
+			return false
+		end
+	end
+	return true
 end
 
 local function getLocalRoot()
@@ -6122,7 +6582,48 @@ local doUptilt = LPH_NO_VIRTUALIZE(function(step, token)
 	waitWithCancel(m1HoldSeconds, token)
 end)
 
-local doTween = LPH_NO_VIRTUALIZE(function(step, target, token)
+local doUpfling = LPH_NO_VIRTUALIZE(function(step, token)
+	local jumpHoldSeconds = math.max(10, safeNumber(step.jumpHoldMs, 400)) / 1000
+	local m1HoldSeconds = math.max(10, safeNumber(step.m1HoldMs, 230)) / 1000
+	InputClient.jumpHold(jumpHoldSeconds)
+	InputClient.m1Hold(m1HoldSeconds)
+	waitWithCancel(math.max(jumpHoldSeconds, m1HoldSeconds), token)
+end)
+
+local doJumpHold = LPH_NO_VIRTUALIZE(function(step, token)
+	local holdSeconds = math.max(0, safeNumber(step.holdMs, 400)) / 1000
+	if holdSeconds <= 0 then
+		return
+	end
+	InputClient.jumpHold(holdSeconds)
+	waitWithCancel(holdSeconds, token)
+end)
+
+local doJump = LPH_NO_VIRTUALIZE(function(step, token)
+	local count = math.max(1, safeNumber(step.count, 1))
+	local holdSeconds = math.max(0, safeNumber(step.holdMs, 50)) / 1000
+	local gapSeconds = math.max(0, safeNumber(step.gapMs, 120)) / 1000
+	for i = 1, count do
+		if not isRunning(token) then
+			return
+		end
+		if holdSeconds > 0 then
+			InputClient.jumpHold(holdSeconds)
+			if not waitWithCancel(holdSeconds, token) then
+				return
+			end
+		else
+			InputClient.jump()
+		end
+		if i < count and gapSeconds > 0 then
+			if not waitWithCancel(gapSeconds, token) then
+				return
+			end
+		end
+	end
+end)
+
+local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	if not target or not target.root then
 		return
 	end
@@ -6131,31 +6632,120 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token)
 		return
 	end
 	local maxDistance = safeNumber(step.maxDistance, optionValue("AutoComboTweenMaxDistance", 15))
-	local dist = (target.root.Position - localRoot.Position).Magnitude
-	if maxDistance > 0 and dist > maxDistance then
-		return
-	end
-	local tweenTime = math.max(0, safeNumber(step.tweenTime, optionValue("AutoComboTweenTime", 0.25)))
 	local offset = vectorFromOffset(step.offset)
-	local head = target.character and target.character:FindFirstChild("Head") or target.root
+	local durationSeconds = tonumber(step.durationSeconds)
+	local speed = math.max(0, safeNumber(step.speed, optionValue("AutoComboTweenSpeed", 60)))
+
+	local function resolveHead()
+		return target.character and target.character:FindFirstChild("Head") or target.root
+	end
+
+	local head = resolveHead()
 	if not head then
 		return
 	end
-	local dest = head.Position + offset
-	local cf = CFrame.new(dest, dest + localRoot.CFrame.LookVector)
-	local tween = TweenService:Create(localRoot, TweenInfo.new(tweenTime, Enum.EasingStyle.Linear), { CFrame = cf })
-	tween:Play()
-	if tweenTime > 0 then
-		local endTime = os.clock() + tweenTime
-		while os.clock() < endTime do
-			if not isRunning(token) then
-				pcall(function()
-					tween:Cancel()
-				end)
+
+	local dist = (head.Position - localRoot.Position).Magnitude
+	if not durationSeconds then
+		if maxDistance > 0 and dist > maxDistance then
+			return
+		end
+	end
+
+	local totalTime = 0
+	if durationSeconds and durationSeconds > 0 then
+		totalTime = durationSeconds
+	elseif speed > 0 then
+		totalTime = dist / speed
+	end
+	if totalTime <= 0 then
+		return
+	end
+
+	local function computeRelativeOffset(vec)
+		if not step.relativeOffset then
+			return vec
+		end
+		local basis = nil
+		if step.relativeToLocal then
+			basis = localRoot and localRoot.CFrame or headInstance.CFrame
+		else
+			basis = (target and target.root and target.root.CFrame) or headInstance.CFrame
+		end
+		local forward = Vector3.new(basis.LookVector.X, 0, basis.LookVector.Z)
+		if forward.Magnitude > 1e-3 then
+			forward = forward.Unit
+		else
+			forward = Vector3.new(0, 0, -1)
+		end
+		local right = Vector3.new(basis.RightVector.X, 0, basis.RightVector.Z)
+		if right.Magnitude > 1e-3 then
+			right = right.Unit
+		else
+			right = Vector3.new(1, 0, 0)
+		end
+		return right * vec.X + Vector3.new(0, 1, 0) * vec.Y + forward * vec.Z
+	end
+
+	local function computeOffset(headInstance)
+		if not step.alignFeet then
+			return computeRelativeOffset(offset)
+		end
+		local character = Players.LocalPlayer and Players.LocalPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local hip = humanoid and humanoid.HipHeight or (localRoot.Size.Y / 2)
+		local headHalf = headInstance and headInstance.Size and headInstance.Size.Y / 2 or 1.5
+		local baseOffset = offset + Vector3.new(0, headHalf + hip, 0)
+		return computeRelativeOffset(baseOffset)
+	end
+
+	local start = os.clock()
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local walkForce = 0.05
+	while os.clock() - start < totalTime do
+		if not isRunning(token) then
+			return
+		end
+		if not isTargetValid(target) then
+			if Configuration.expectToggleValue("AutoComboRetargetOnInvalid") and state then
+				target = resolveTarget(state)
+			end
+			if not isTargetValid(target) then
+				if Configuration.expectToggleValue("AutoComboLockTarget") and state and state.lockedTarget then
+					AutoCombo.stop()
+				end
 				return
 			end
-			task.wait()
 		end
+		head = resolveHead()
+		if not head then
+			return
+		end
+		local dest = head.Position + computeOffset(head)
+		local current = localRoot.Position
+		local toDest = dest - current
+		local distance = toDest.Magnitude
+		if humanoid then
+			humanoid:Move(localRoot.CFrame.LookVector * walkForce, false)
+		end
+		if distance > 0.001 then
+			local dt = RunService.RenderStepped:Wait()
+			local stepDist = speed > 0 and speed * dt or distance
+			if stepDist > distance then
+				stepDist = distance
+			end
+			local newPos = current + toDest.Unit * stepDist
+			local rotation = localRoot.CFrame - localRoot.CFrame.Position
+			localRoot.CFrame = CFrame.new(newPos) * rotation
+		else
+			RunService.RenderStepped:Wait()
+		end
+	end
+	if humanoid then
+		pcall(function()
+			humanoid:Move(Vector3.zero, false)
+		end)
 	end
 end)
 
@@ -6168,33 +6758,44 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	if not humanoid then
 		return
 	end
-	local timeout = math.max(0, safeNumber(step.timeoutMs, optionValue("AutoComboMoveToTimeoutMs", 1200))) / 1000
+	local duration = math.max(0, safeNumber(step.durationSeconds, optionValue("AutoComboMoveToDurationSeconds", 1.2)))
 	local stopDistance = math.max(0, safeNumber(step.stopDistance, optionValue("AutoComboMoveToStopDistance", 4)))
-	local maxDistance = math.max(0, safeNumber(step.maxDistance, DEFAULT_MOVE_MAX_DISTANCE))
 	local useSprint = step.useSprint == true
 	local sprintHold = math.max(0, safeNumber(optionValue("AutoComboSprintHoldMs", 350), 350)) / 1000
 
+	if duration <= 0 then
+		return
+	end
+
 	local start = os.clock()
 	local lastSprint = 0
-	while os.clock() - start <= timeout do
+	local lastPos = target and target.root and target.root.Position or nil
+	while os.clock() - start <= duration do
 		if not isRunning(token) then
 			return
 		end
-		if not target or not isTargetValid(target) then
+		if target and isTargetValid(target) then
+			state.lastTarget = target
+			lastPos = target.root.Position
+		else
 			target = resolveTarget(state)
-			if not target then
+			if target and isTargetValid(target) then
+				state.lastTarget = target
+				lastPos = target.root.Position
+			else
+				if Configuration.expectToggleValue("AutoComboLockTarget") and state.lockedTarget then
+					AutoCombo.stop()
+				end
 				return
 			end
 		end
-		state.lastTarget = target
-		local dist = (target.root.Position - localRoot.Position).Magnitude
-		if dist <= stopDistance then
-			return
+		if lastPos then
+			local dist = (lastPos - localRoot.Position).Magnitude
+			if stopDistance > 0 and dist <= stopDistance then
+				break
+			end
+			humanoid:MoveTo(lastPos)
 		end
-		if maxDistance > 0 and dist > maxDistance then
-			return
-		end
-		humanoid:MoveTo(target.root.Position)
 		if useSprint and sprintHold > 0 then
 			local now = os.clock()
 			if now - lastSprint >= sprintHold * 0.8 then
@@ -6204,7 +6805,87 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 		end
 		task.wait(0.05)
 	end
+	pcall(function()
+		humanoid:Move(Vector3.zero, false)
+	end)
+	pcall(function()
+		humanoid:MoveTo(localRoot.Position)
+	end)
 end)
+
+local function executeStep(step, token, state)
+	if step.type == "Wait" then
+		waitWithCancel((step.durationMs or 0) / 1000, token)
+	elseif step.type == "Skill" then
+		fireSkill(step)
+	elseif step.type == "M1" then
+		doM1(step, token)
+	elseif step.type == "Uptilt" then
+		doUptilt(step, token)
+	elseif step.type == "Upfling" then
+		doUpfling(step, token)
+	elseif step.type == "JumpHold" then
+		doJumpHold(step, token)
+	elseif step.type == "Jump" then
+		doJump(step, token)
+	elseif step.type == "TweenToHead" then
+		local target = resolveTarget(state)
+		if not target or not isTargetValid(target) then
+			if Configuration.expectToggleValue("AutoComboLockTarget") and state.lockedTarget then
+				AutoCombo.stop()
+			end
+			return
+		end
+		doTween(step, target, token, state)
+	elseif step.type == "MoveToTarget" then
+		local target = resolveTarget(state)
+		if not target or not isTargetValid(target) then
+			if Configuration.expectToggleValue("AutoComboLockTarget") and state.lockedTarget then
+				AutoCombo.stop()
+			end
+			return
+		end
+		doMoveTo(step, target, token, state)
+	elseif step.type == "Dash" then
+		local dir = step.dir or "right"
+		InputClient.dash(dir)
+	elseif step.type == "CameraPitch" then
+		local cam = workspace.CurrentCamera
+		if not cam then
+			return
+		end
+		local pitch0, yaw0, roll0 = cam.CFrame:ToOrientation()
+		local targetPitch = math.rad(step.pitchDegrees or -45)
+		local duration = math.max(0, (step.durationMs or 0) / 1000)
+		local hold = math.max(0, (step.holdMs or 0) / 1000)
+		local reset = math.max(0, (step.resetMs or 0) / 1000)
+		local function lerpPitch(fromPitch, toPitch, seconds)
+			if seconds <= 0 then
+				cam.CFrame = CFrame.new(cam.CFrame.Position) * CFrame.fromOrientation(toPitch, yaw0, roll0)
+				return
+			end
+			local start = os.clock()
+			while os.clock() - start < seconds do
+				if not isRunning(token) then
+					return
+				end
+				local alpha = math.clamp((os.clock() - start) / seconds, 0, 1)
+				local p = fromPitch + (toPitch - fromPitch) * alpha
+				cam.CFrame = CFrame.new(cam.CFrame.Position) * CFrame.fromOrientation(p, yaw0, roll0)
+				RunService.RenderStepped:Wait()
+			end
+		end
+		lerpPitch(pitch0, targetPitch, duration)
+		if hold > 0 then
+			if not waitWithCancel(hold, token) then
+				return
+			end
+		end
+		if reset > 0 then
+			lerpPitch(targetPitch, pitch0, reset)
+		end
+	end
+end
 
 local runProfile = LPH_NO_VIRTUALIZE(function(profile, token)
 	if Configuration.expectToggleValue("AutoComboLockTarget") then
@@ -6214,30 +6895,21 @@ local runProfile = LPH_NO_VIRTUALIZE(function(profile, token)
 		if not isRunning(token) then
 			break
 		end
+		if not ensureTargetAlive(comboState) then
+			break
+		end
 		comboState.currentStep = index
 		local normalized = coerceStep(step)
 		if normalized then
-			if normalized.type == "Wait" then
-				waitWithCancel((normalized.durationMs or 0) / 1000, token)
-			elseif normalized.type == "Skill" then
-				fireSkill(normalized)
-			elseif normalized.type == "M1" then
-				doM1(normalized, token)
-			elseif normalized.type == "Uptilt" then
-				doUptilt(normalized, token)
-			elseif normalized.type == "TweenToHead" then
-				local target = resolveTarget(comboState)
-				if target then
-					doTween(normalized, target, token)
-				end
-			elseif normalized.type == "MoveToTarget" then
-				local target = resolveTarget(comboState)
-				if target then
-					doMoveTo(normalized, target, token, comboState)
-				end
-			elseif normalized.type == "Dash" then
-				local dir = normalized.dir or "right"
-				InputClient.dash(dir)
+			if normalized.parallel == true then
+				TaskSpawner.spawn("AutoCombo_Step_" .. tostring(normalized.type), LPH_NO_VIRTUALIZE(function()
+					if not isRunning(token) then
+						return
+					end
+					executeStep(normalized, token, comboState)
+				end))
+			else
+				executeStep(normalized, token, comboState)
 			end
 		end
 		if not isRunning(token) then
@@ -6258,6 +6930,9 @@ local runProfile = LPH_NO_VIRTUALIZE(function(profile, token)
 		comboState.currentStep = nil
 		comboState.lockedTarget = nil
 		comboState.lastTarget = nil
+		if Logger and Logger.notify then
+			Logger.notify("Auto-Combo finished: %s", profile.name or "Profile")
+		end
 	end
 end)
 
@@ -25572,6 +26247,34 @@ autoComboToggle:AddKeyPicker("AutoComboKeybind", {
 	Modes = { "Hold" },
 	Text = "Auto-Combo",
 })
+local autoComboOnM1Toggle = autoComboControl:AddToggle("AutoComboOnM1Hit", {
+	Text = "Auto-Combo On Local M1 Hit",
+	Default = true,
+	Tooltip = "Start Auto-Combo when your local M1 hits (LastHit + window).",
+})
+local autoComboOnM1Dep = autoComboControl:AddDependencyBox()
+autoComboOnM1Dep:AddSlider("AutoComboOnM1HoldMs", {
+	Text = "M1 Hit Window",
+	Min = 50,
+	Max = 1000,
+	Default = 250,
+	Suffix = "ms",
+	Rounding = 0,
+	Tooltip = "Time window after local M1 animation to match LastHit.",
+})
+autoComboOnM1Dep:SetupDependencies({
+	{ autoComboOnM1Toggle, true },
+})
+local autoComboStopToggle = autoComboControl:AddToggle("AutoComboStopKeybindEnabled", {
+	Text = "Stop Auto-Combo Keybind",
+	Default = true,
+})
+autoComboStopToggle:AddKeyPicker("AutoComboStopKeybind", {
+	Default = "N/A",
+	Mode = "Hold",
+	Modes = { "Hold" },
+	Text = "Stop Auto-Combo",
+})
 autoComboControl:AddSlider("AutoComboDefaultStepDelayMs", {
 	Text = "Default Step Delay",
 	Min = 0,
@@ -25596,21 +26299,21 @@ autoComboControl:AddSlider("AutoComboTweenMaxDistance", {
 	Suffix = "studs",
 	Rounding = 1,
 })
-autoComboControl:AddSlider("AutoComboTweenTime", {
-	Text = "Tween Time",
+autoComboControl:AddSlider("AutoComboTweenSpeed", {
+	Text = "Tween Speed",
+	Min = 1,
+	Max = 200,
+	Default = 60,
+	Suffix = "studs/s",
+	Rounding = 0,
+})
+autoComboControl:AddSlider("AutoComboMoveToDurationSeconds", {
+	Text = "MoveTo Duration",
 	Min = 0,
-	Max = 1,
-	Default = 0.25,
+	Max = 10,
+	Default = 1.2,
 	Suffix = "s",
 	Rounding = 2,
-})
-autoComboControl:AddSlider("AutoComboMoveToTimeoutMs", {
-	Text = "MoveTo Timeout",
-	Min = 0,
-	Max = 5000,
-	Default = 1200,
-	Suffix = "ms",
-	Rounding = 0,
 })
 autoComboControl:AddSlider("AutoComboMoveToStopDistance", {
 	Text = "MoveTo Stop Distance",
@@ -25666,8 +26369,13 @@ local autoComboStepList = autoComboStepsGroup:AddDropdown("AutoComboStepList", {
 local autoComboEditorGroup = autoComboTab:AddRightGroupbox("Step Editor")
 local autoComboStepType = autoComboEditorGroup:AddDropdown("AutoComboStepType", {
 	Text = "Step Type",
-	Values = { "Skill", "Wait", "M1", "Uptilt", "TweenToHead", "MoveToTarget", "Dash" },
+	Values = { "Skill", "Wait", "M1", "Uptilt", "Upfling", "JumpHold", "Jump", "TweenToHead", "MoveToTarget", "Dash" },
 	Default = "Skill",
+})
+local autoComboParallel = autoComboEditorGroup:AddToggle("AutoComboStepParallel", {
+	Text = "Parallel (Non-Blocking)",
+	Default = false,
+	Tooltip = "Run this step in the background and continue to the next step immediately.",
 })
 
 local skillDep = autoComboEditorGroup:AddDependencyBox()
@@ -25735,13 +26443,60 @@ uptiltDep:SetupDependencies({
 	{ autoComboStepType, "Uptilt" },
 })
 
+local upflingDep = autoComboEditorGroup:AddDependencyBox()
+local upflingJumpHold = upflingDep:AddInput("AutoComboStepUpflingJumpHold", {
+	Text = "Jump Hold (ms)",
+	Numeric = true,
+})
+local upflingM1Hold = upflingDep:AddInput("AutoComboStepUpflingM1Hold", {
+	Text = "M1 Hold (ms)",
+	Numeric = true,
+})
+upflingDep:SetupDependencies({
+	{ autoComboStepType, "Upfling" },
+})
+
+local jumpHoldDep = autoComboEditorGroup:AddDependencyBox()
+local jumpHoldMs = jumpHoldDep:AddInput("AutoComboStepJumpHold", {
+	Text = "Hold (ms)",
+	Numeric = true,
+})
+jumpHoldDep:SetupDependencies({
+	{ autoComboStepType, "JumpHold" },
+})
+
+local jumpDep = autoComboEditorGroup:AddDependencyBox()
+local jumpCount = jumpDep:AddInput("AutoComboStepJumpCount", {
+	Text = "Jump Count",
+	Numeric = true,
+})
+local jumpHoldTap = jumpDep:AddInput("AutoComboStepJumpHoldTap", {
+	Text = "Jump Hold (ms)",
+	Numeric = true,
+})
+local jumpGap = jumpDep:AddInput("AutoComboStepJumpGap", {
+	Text = "Jump Gap (ms)",
+	Numeric = true,
+})
+jumpDep:SetupDependencies({
+	{ autoComboStepType, "Jump" },
+})
+
 local tweenDep = autoComboEditorGroup:AddDependencyBox()
 local tweenMaxDistance = tweenDep:AddInput("AutoComboStepTweenMaxDistance", {
 	Text = "Max Distance",
 	Numeric = true,
 })
-local tweenTime = tweenDep:AddInput("AutoComboStepTweenTime", {
-	Text = "Tween Time (s)",
+local tweenDuration = tweenDep:AddInput("AutoComboStepTweenDuration", {
+	Text = "Duration (s)",
+	Numeric = true,
+})
+local tweenAlignFeet = tweenDep:AddToggle("AutoComboStepTweenAlignFeet", {
+	Text = "Align Feet On Head",
+	Default = false,
+})
+local tweenSpeed = tweenDep:AddInput("AutoComboStepTweenSpeed", {
+	Text = "Tween Speed (studs/s)",
 	Numeric = true,
 })
 local tweenOffsetX = tweenDep:AddInput("AutoComboStepTweenOffsetX", {
@@ -25761,16 +26516,16 @@ tweenDep:SetupDependencies({
 })
 
 local moveDep = autoComboEditorGroup:AddDependencyBox()
-local moveMaxDistance = moveDep:AddInput("AutoComboStepMoveMaxDistance", {
-	Text = "Max Distance",
+local moveDuration = moveDep:AddInput("AutoComboStepMoveDuration", {
+	Text = "Duration (s)",
 	Numeric = true,
 })
 local moveStopDistance = moveDep:AddInput("AutoComboStepMoveStopDistance", {
 	Text = "Stop Distance",
 	Numeric = true,
 })
-local moveTimeout = moveDep:AddInput("AutoComboStepMoveTimeout", {
-	Text = "Timeout (ms)",
+local moveDelayAfter = moveDep:AddInput("AutoComboStepMoveDelayAfter", {
+	Text = "Delay After (ms)",
 	Numeric = true,
 })
 local moveUseSprint = moveDep:AddToggle("AutoComboStepMoveUseSprint", {
@@ -25816,13 +26571,13 @@ end
 
 local function defaultStep(stepType)
 	if stepType == "Skill" then
-		return { type = "Skill", slot = 1, toolName = "", delayAfterMs = nil }
+		return { type = "Skill", slot = 1, toolName = "", delayAfterMs = nil, parallel = false }
 	end
 	if stepType == "Wait" then
-		return { type = "Wait", durationMs = 1000 }
+		return { type = "Wait", durationMs = 1000, parallel = false }
 	end
 	if stepType == "M1" then
-		return { type = "M1", holdMs = 60, ["repeat"] = 1, gapMs = 60 }
+		return { type = "M1", holdMs = 60, ["repeat"] = 1, gapMs = 60, parallel = false }
 	end
 	if stepType == "Uptilt" then
 		return {
@@ -25830,27 +26585,43 @@ local function defaultStep(stepType)
 			jumpHoldMs = Options["AutoComboUptiltJumpHoldMs"] and Options["AutoComboUptiltJumpHoldMs"].Value or 120,
 			m1HoldMs = Options["AutoComboUptiltM1HoldMs"] and Options["AutoComboUptiltM1HoldMs"].Value or 60,
 			delayBeforeM1Ms = 30,
+			parallel = false,
 		}
+	end
+	if stepType == "Upfling" then
+		return { type = "Upfling", jumpHoldMs = 400, m1HoldMs = 230, parallel = false }
+	end
+	if stepType == "JumpHold" then
+		return { type = "JumpHold", holdMs = 400, parallel = false }
+	end
+	if stepType == "Jump" then
+		return { type = "Jump", count = 2, holdMs = 50, gapMs = 120, parallel = false }
 	end
 	if stepType == "TweenToHead" then
 		return {
 			type = "TweenToHead",
 			maxDistance = Options["AutoComboTweenMaxDistance"] and Options["AutoComboTweenMaxDistance"].Value or 15,
-			tweenTime = Options["AutoComboTweenTime"] and Options["AutoComboTweenTime"].Value or 0.25,
+			durationSeconds = nil,
+			alignFeet = false,
+			speed = Options["AutoComboTweenSpeed"] and Options["AutoComboTweenSpeed"].Value or 60,
 			offset = { x = 0, y = 0, z = 0 },
+			parallel = false,
 		}
 	end
 	if stepType == "MoveToTarget" then
 		return {
 			type = "MoveToTarget",
-			maxDistance = 60,
+			durationSeconds = Options["AutoComboMoveToDurationSeconds"]
+					and Options["AutoComboMoveToDurationSeconds"].Value
+				or 1.2,
 			stopDistance = Options["AutoComboMoveToStopDistance"] and Options["AutoComboMoveToStopDistance"].Value or 4,
-			timeoutMs = Options["AutoComboMoveToTimeoutMs"] and Options["AutoComboMoveToTimeoutMs"].Value or 1200,
+			delayAfterMs = nil,
 			useSprint = true,
+			parallel = false,
 		}
 	end
 	if stepType == "Dash" then
-		return { type = "Dash", dir = "right" }
+		return { type = "Dash", dir = "right", parallel = false }
 	end
 	return { type = stepType }
 end
@@ -25860,22 +26631,33 @@ local function stepSummary(step, index)
 		return string.format("%02d: <none>", index)
 	end
 	local stype = step.type or "Unknown"
+	local prefix = step.parallel and "[P] " or ""
 	if stype == "Skill" then
-		return string.format("%02d: Skill slot %s", index, tostring(step.slot or 1))
+		return string.format("%02d: %sSkill slot %s", index, prefix, tostring(step.slot or 1))
 	elseif stype == "Wait" then
-		return string.format("%02d: Wait %sms", index, tostring(step.durationMs or 0))
+		return string.format("%02d: %sWait %sms", index, prefix, tostring(step.durationMs or 0))
 	elseif stype == "M1" then
-		return string.format("%02d: M1 x%s", index, tostring(step["repeat"] or 1))
+		return string.format("%02d: %sM1 x%s", index, prefix, tostring(step["repeat"] or 1))
 	elseif stype == "Uptilt" then
-		return string.format("%02d: Uptilt", index)
+		return string.format("%02d: %sUptilt", index, prefix)
+	elseif stype == "Upfling" then
+		return string.format("%02d: %sUpfling", index, prefix)
+	elseif stype == "JumpHold" then
+		return string.format("%02d: %sJumpHold %sms", index, prefix, tostring(step.holdMs or 0))
+	elseif stype == "Jump" then
+		return string.format("%02d: %sJump x%s", index, prefix, tostring(step.count or 1))
 	elseif stype == "TweenToHead" then
-		return string.format("%02d: TweenToHead", index)
+		return string.format("%02d: %sTweenToHead", index, prefix)
 	elseif stype == "MoveToTarget" then
-		return string.format("%02d: MoveToTarget", index)
+		local dur = step.durationSeconds or Options["AutoComboMoveToDurationSeconds"] and Options["AutoComboMoveToDurationSeconds"].Value
+		if dur and tonumber(dur) then
+			return string.format("%02d: %sMoveTo %.2fs", index, prefix, tonumber(dur))
+		end
+		return string.format("%02d: %sMoveToTarget", index, prefix)
 	elseif stype == "Dash" then
-		return string.format("%02d: Dash %s", index, tostring(step.dir or "right"))
+		return string.format("%02d: %sDash %s", index, prefix, tostring(step.dir or "right"))
 	end
-	return string.format("%02d: %s", index, tostring(stype))
+	return string.format("%02d: %s%s", index, prefix, tostring(stype))
 end
 
 local function refreshStepList(selectIndex)
@@ -25910,6 +26692,7 @@ local function loadStepToEditor(step)
 	autoComboState.updating = true
 	if not step then
 		autoComboStepType:SetValue("Skill")
+		autoComboParallel:SetValue(false)
 		skillSlot:SetRawValue(1)
 		skillToolName:SetRawValue("")
 		skillDelayAfter:SetRawValue("")
@@ -25920,14 +26703,22 @@ local function loadStepToEditor(step)
 		uptiltJumpHold:SetRawValue("")
 		uptiltM1Hold:SetRawValue("")
 		uptiltDelay:SetRawValue("")
+		upflingJumpHold:SetRawValue("")
+		upflingM1Hold:SetRawValue("")
+		jumpHoldMs:SetRawValue("")
+		jumpCount:SetRawValue("")
+		jumpHoldTap:SetRawValue("")
+		jumpGap:SetRawValue("")
+		tweenDuration:SetRawValue("")
+		tweenAlignFeet:SetValue(false)
 		tweenMaxDistance:SetRawValue("")
-		tweenTime:SetRawValue("")
+		tweenSpeed:SetRawValue("")
 		tweenOffsetX:SetRawValue("")
 		tweenOffsetY:SetRawValue("")
 	tweenOffsetZ:SetRawValue("")
-	moveMaxDistance:SetRawValue("")
+	moveDuration:SetRawValue("")
 	moveStopDistance:SetRawValue("")
-	moveTimeout:SetRawValue("")
+	moveDelayAfter:SetRawValue("")
 	moveUseSprint:SetValue(false)
 	dashDir:SetValue("right")
 	Library:UpdateDependencyBoxes()
@@ -25935,6 +26726,7 @@ local function loadStepToEditor(step)
 	return
 end
 	autoComboStepType:SetValue(step.type or "Skill")
+	autoComboParallel:SetValue(step.parallel == true)
 	skillSlot:SetRawValue(step.slot or 1)
 	skillToolName:SetRawValue(step.toolName or "")
 	skillDelayAfter:SetRawValue(step.delayAfterMs or "")
@@ -25945,15 +26737,24 @@ end
 	uptiltJumpHold:SetRawValue(step.jumpHoldMs or "")
 	uptiltM1Hold:SetRawValue(step.m1HoldMs or "")
 	uptiltDelay:SetRawValue(step.delayBeforeM1Ms or "")
+	upflingJumpHold:SetRawValue(step.jumpHoldMs or "")
+	upflingM1Hold:SetRawValue(step.m1HoldMs or "")
+	jumpHoldMs:SetRawValue(step.holdMs or "")
+	jumpCount:SetRawValue(step.count or "")
+	jumpHoldTap:SetRawValue(step.holdMs or "")
+	jumpGap:SetRawValue(step.gapMs or "")
+	tweenDuration:SetRawValue(step.durationSeconds or "")
+	tweenAlignFeet:SetValue(step.alignFeet == true)
 	tweenMaxDistance:SetRawValue(step.maxDistance or "")
-	tweenTime:SetRawValue(step.tweenTime or "")
+	local defaultSpeed = Options["AutoComboTweenSpeed"] and Options["AutoComboTweenSpeed"].Value or 60
+	tweenSpeed:SetRawValue(step.speed or defaultSpeed)
 	local offset = step.offset or {}
 	tweenOffsetX:SetRawValue(offset.x or 0)
 	tweenOffsetY:SetRawValue(offset.y or 0)
 	tweenOffsetZ:SetRawValue(offset.z or 0)
-	moveMaxDistance:SetRawValue(step.maxDistance or "")
+	moveDuration:SetRawValue(step.durationSeconds or "")
 	moveStopDistance:SetRawValue(step.stopDistance or "")
-	moveTimeout:SetRawValue(step.timeoutMs or "")
+	moveDelayAfter:SetRawValue(step.delayAfterMs or "")
 	moveUseSprint:SetValue(step.useSprint == true)
 	dashDir:SetValue(step.dir or "right")
 	Library:UpdateDependencyBoxes()
@@ -26074,11 +26875,35 @@ end)
 uptiltDelay:OnChanged(function(value)
 	updateStepField("delayBeforeM1Ms", tonumber(value) or 0)
 end)
+upflingJumpHold:OnChanged(function(value)
+	updateStepField("jumpHoldMs", tonumber(value) or 0)
+end)
+upflingM1Hold:OnChanged(function(value)
+	updateStepField("m1HoldMs", tonumber(value) or 0)
+end)
+jumpHoldMs:OnChanged(function(value)
+	updateStepField("holdMs", tonumber(value) or 0)
+end)
+jumpCount:OnChanged(function(value)
+	updateStepField("count", tonumber(value) or 1, true)
+end)
+jumpHoldTap:OnChanged(function(value)
+	updateStepField("holdMs", tonumber(value) or 0)
+end)
+jumpGap:OnChanged(function(value)
+	updateStepField("gapMs", tonumber(value) or 0)
+end)
 tweenMaxDistance:OnChanged(function(value)
 	updateStepField("maxDistance", tonumber(value) or 0)
 end)
-tweenTime:OnChanged(function(value)
-	updateStepField("tweenTime", tonumber(value) or 0)
+tweenDuration:OnChanged(function(value)
+	updateStepField("durationSeconds", tonumber(value) or 0)
+end)
+tweenAlignFeet:OnChanged(function(value)
+	updateStepField("alignFeet", value == true)
+end)
+tweenSpeed:OnChanged(function(value)
+	updateStepField("speed", tonumber(value) or 0)
 end)
 tweenOffsetX:OnChanged(function(value)
 	if autoComboState.updating then
@@ -26113,20 +26938,23 @@ tweenOffsetZ:OnChanged(function(value)
 	step.offset = step.offset or {}
 	step.offset.z = tonumber(value) or 0
 end)
-moveMaxDistance:OnChanged(function(value)
-	updateStepField("maxDistance", tonumber(value) or 0)
-end)
 moveStopDistance:OnChanged(function(value)
 	updateStepField("stopDistance", tonumber(value) or 0)
 end)
-moveTimeout:OnChanged(function(value)
-	updateStepField("timeoutMs", tonumber(value) or 0)
+moveDuration:OnChanged(function(value)
+	updateStepField("durationSeconds", tonumber(value) or 0)
+end)
+moveDelayAfter:OnChanged(function(value)
+	updateStepField("delayAfterMs", tonumber(value) or 0)
 end)
 moveUseSprint:OnChanged(function(value)
 	updateStepField("useSprint", value == true)
 end)
 dashDir:OnChanged(function(value)
 	updateStepField("dir", value or "right", true)
+end)
+autoComboParallel:OnChanged(function(value)
+	updateStepField("parallel", value == true, true)
 end)
 
 autoComboStepsGroup:AddButton("Add Step", function()
@@ -26273,73 +27101,6 @@ loadStepToEditor(nil)
 end
 
 local autoCounterTab = window:AddTab("Auto-Counter")
-local hbExpanderTab = window:AddTab("Hitbox expander m1s")
-local hbExpanderGroup = hbExpanderTab:AddLeftGroupbox("M1 Hitbox Settings")
-
-
-_G.HeadSize = 50
-_G.HitboxEnabled = false
-
-
-hbExpanderGroup:AddToggle("EnableHitboxExpander", {
-    Text = "Enable Hitbox Expander",
-    Default = false,
-    Tooltip = "Makes enemy hitboxes larger so your M1s hit easier.",
-    Callback = function(Value)
-        _G.HitboxEnabled = Value
-    end
-})
-
-
-hbExpanderGroup:AddSlider("HitboxSizeSlider", {
-    Text = "Hitbox Size",
-    Min = 2,
-    Max = 100,
-    Default = 50,
-    Rounding = 0,
-    Callback = function(Value)
-        _G.HeadSize = Value
-    end
-})
-
-
-game:GetService('RunService').RenderStepped:Connect(function()
-    if _G.HitboxEnabled then
-        for _, v in next, game:GetService('Players'):GetPlayers() do
-            if v ~= game:GetService('Players').LocalPlayer then
-                pcall(function()
-                    if v.Character and v.Character:FindFirstChild("HumanoidRootPart") then
-                        local hrp = v.Character.HumanoidRootPart
-                        hrp.Size = Vector3.new(_G.HeadSize, _G.HeadSize, _G.HeadSize)
-                        hrp.Transparency = 0.7
-                        hrp.BrickColor = BrickColor.new("Really blue")
-                        hrp.Material = Enum.Material.Neon
-                        hrp.CanCollide = false
-                    end
-                end)
-            end
-        end
-    else
-        
-        for _, v in next, game:GetService('Players'):GetPlayers() do
-            if v ~= game:GetService('Players').LocalPlayer then
-                pcall(function()
-                    if v.Character and v.Character:FindFirstChild("HumanoidRootPart") then
-                        local hrp = v.Character.HumanoidRootPart
-                        -- Default Roblox HRP size is 2, 2, 1
-                        if hrp.Size ~= Vector3.new(2, 2, 1) then
-                            hrp.Size = Vector3.new(2, 2, 1)
-                            hrp.Transparency = 1
-                            hrp.BrickColor = BrickColor.new("Medium stone grey")
-                            hrp.Material = Enum.Material.Plastic
-                            hrp.CanCollide = true
-                        end
-                    end
-                end)
-            end
-        end
-    end
-end)
 local autoCounterGroup = autoCounterTab:AddLeftGroupbox("Keybind Press")
 autoCounterGroup:AddDropdown("AutoCounterKey", {
 	Text = "Auto Counter Key",
@@ -26558,6 +27319,7 @@ local UsingSkillWatcher = require("Features/Combat/UsingSkillWatcher")
 local InputClient = require("Game/InputClient")
 local M1AutoTrade = require("Features/Combat/M1AutoTrade")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+M1AutoTrade.init()
 
 local EFFECT_MAX_DEPTH = 6
 local EFFECT_MAX_TABLE_ENTRIES = 60
@@ -27200,6 +27962,24 @@ if Options["AutoComboKeybind"] then
 			return Logger.longNotify("Please select an Auto-Combo profile.")
 		end
 		AutoCombo.run(profileName)
+	end)
+end
+
+local autoComboStopHeld = false
+if Options["AutoComboStopKeybind"] then
+	Options["AutoComboStopKeybind"]:OnClick(function(toggled)
+		if not toggled then
+			autoComboStopHeld = false
+			return
+		end
+		if autoComboStopHeld then
+			return
+		end
+		autoComboStopHeld = true
+		if not Configuration.expectToggleValue("AutoComboStopKeybindEnabled") then
+			return
+		end
+		AutoCombo.stop()
 	end)
 end
 
