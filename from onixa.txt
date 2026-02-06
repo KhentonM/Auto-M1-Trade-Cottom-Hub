@@ -12,6 +12,20 @@ _G.PP_SCRAMBLE_NUM = _G.PP_SCRAMBLE_NUM or PP_SCRAMBLE_NUM
 _G.PP_SCRAMBLE_RE_NUM = _G.PP_SCRAMBLE_RE_NUM or PP_SCRAMBLE_RE_NUM
 shared = shared or {}
 shared.Lycoris = shared.Lycoris or { silent = false }
+local NO_HITBOX_ONLY = true
+local NO_HITBOX_PROFILE_DEFAULT = "Max Survival"
+local NO_HITBOX_PROFILE_MIN_CONFIDENCE = {
+	["Max Survival"] = 2.0,
+	["Balanced"] = 2.8,
+	["Low Noise"] = 3.8,
+}
+local activeSkillDef = nil
+local executeDefensiveAction = function(_, _, actionFn)
+	if type(actionFn) == "function" then
+		return actionFn()
+	end
+	return nil
+end
 if not shared.Lycoris.DefenseSignals then
 	shared.Lycoris.DefenseSignals = setmetatable({}, { __mode = "k" })
 else
@@ -741,7 +755,7 @@ AnimatorDefender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 	local info = RepeatInfo.new(timing)
 	info.track = self.track
 
-	local hc = self:hybridCheck(options, timing, action, timing.duih and info or nil)
+	local hc = self:hc(options, timing.duih and info or nil)
 	if hc then
 		return true
 	end
@@ -1202,6 +1216,12 @@ local PREDICTION_SPEED_REF = 16
 local PREDICTION_MIN_SCALE = 0.6
 local PREDICTION_MAX_SCALE = 1.4
 local blockTagCounter = 0
+local SIGNAL_WINDOW_SKILL = 0.50
+local SIGNAL_WINDOW_EFFECT = 0.35
+local SIGNAL_WINDOW_ANIMATION = 0.30
+local SIGNAL_WINDOW_PART = 0.26
+local SIGNAL_WINDOW_SOUND = 0.22
+local SIGNAL_WINDOW_MULTI = 0.12
 
 local defenseSignals = (shared and shared.Lycoris and shared.Lycoris.DefenseSignals) or setmetatable({}, { __mode = "k" })
 if shared and shared.Lycoris then
@@ -1221,32 +1241,6 @@ local function signalEntry(entity)
 	return entry
 end
 
-local function resolveSignalEntity(options)
-	if not options then
-		return nil
-	end
-	if options.entity then
-		if typeof(options.entity) == "Instance" and options.entity:IsA("BasePart") then
-			local model = options.entity:FindFirstAncestorWhichIsA("Model")
-			return model or options.entity
-		end
-		return options.entity
-	end
-	if options.part then
-		local model = options.part:FindFirstAncestorWhichIsA("Model")
-		return model or options.part
-	end
-	return nil
-end
-
-local function getLocalRoot()
-	local character = players.LocalPlayer and players.LocalPlayer.Character
-	if not character then
-		return nil
-	end
-	return character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso")
-end
-
 local function timingKey(timing)
 	if timing and type(timing.id) == "function" then
 		local ok, key = pcall(timing.id, timing)
@@ -1255,6 +1249,12 @@ local function timingKey(timing)
 		end
 	end
 	return tostring(timing and timing.name or "Unknown")
+end
+
+local function profileMinConfidence(profileName)
+	return NO_HITBOX_PROFILE_MIN_CONFIDENCE[profileName or ""]
+		or NO_HITBOX_PROFILE_MIN_CONFIDENCE[NO_HITBOX_PROFILE_DEFAULT]
+		or 2.0
 end
 
 local function nextBlockTagId()
@@ -1354,7 +1354,7 @@ Defender.rpue = LPH_NO_VIRTUALIZE(function(self, entity, timing, info)
 	options.part = target and target.root
 	options.entity = entity
 
-	local success = target and self:hybridCheck(options, timing, nil, timing.duih and info or nil)
+	local success = target and self:hc(options, timing.duih and info or nil)
 
 	info.index = info.index + 1
 
@@ -1416,7 +1416,7 @@ Defender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 
 	if
 		selectedFilters["Disable When Textbox Focused"]
-		and (userInputService:GetFocusedTextBox() or chatInputBarConfiguration.IsFocused)
+		and (userInputService:GetFocusedTextBox() or (chatInputBarConfiguration and chatInputBarConfiguration.IsFocused))
 	then
 		return self:notify(timing, "User is typing in a text box.")
 	end
@@ -1443,6 +1443,14 @@ Defender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 		and filterEnabled("Filter Out Others", "Filter Out Undefined")
 	then
 		return self:notify(timing, "Attacker is using an 'Other' attack.")
+	end
+
+	if NO_HITBOX_ONLY and (timing.tag == "Skill" or timing.tag == "Mantra") then
+		local minConfidence = Defender.requiredMinConfidence(timing.tag, timing.minConfidence)
+		local confidence = Defender.getSignalConfidence(self.entity or self.owner or self.part, timing.tag)
+		if confidence < minConfidence then
+			return self:notify(timing, "Signal confidence %.2f < %.2f.", confidence, minConfidence)
+		end
 	end
 
 	return true
@@ -1490,41 +1498,60 @@ function Defender.recordSignal(entity, kind, name)
 	entry.lastAnimId = value
 end
 
-function Defender.hasRecentSignal(entity)
-	if not entity then
-		return false
+function Defender.requiredMinConfidence(tag, overrideValue)
+	local _ = tag
+	if type(overrideValue) == "number" and overrideValue > 0 then
+		return overrideValue
 	end
-	local entry = defenseSignals[entity]
-	if not entry then
-		return false
+	local profile = Configuration.expectOptionValue("DefenseProfile")
+	if type(profile) ~= "string" or profile == "" then
+		profile = NO_HITBOX_PROFILE_DEFAULT
 	end
-	local windowMs = Configuration.expectOptionValue("EffectSignalWindowMs") or 350
-	local window = math.max(0, windowMs) / 1000
-	if window <= 0 then
-		return false
+	local profileDefault = profileMinConfidence(profile)
+	local configured = Configuration.expectOptionValue("NoHitboxMinConfidence")
+	if type(configured) == "number" and configured > 0 then
+		return math.max(configured, profileDefault)
 	end
-	local now = os.clock()
-	local useEffect = Configuration.expectToggleValue("UseEffectSignals") ~= false
+	return profileDefault
+end
 
-	if useEffect and entry.lastEffectAt and now - entry.lastEffectAt <= window then
-		return true
+function Defender.getSignalConfidence(entity, tag)
+	local _ = tag
+	local entry = signalEntry(entity)
+	if not entry then
+		return 0
 	end
-	if entry.lastAnimAt and now - entry.lastAnimAt <= window then
-		return true
+
+	local now = os.clock()
+	local confidence = 0
+	local sourceCount = 0
+
+	local function apply(weight, stamp, window)
+		if type(stamp) ~= "number" then
+			return
+		end
+		local age = now - stamp
+		if age < 0 or age > window then
+			return
+		end
+		local normalized = 1 - (age / window)
+		confidence += weight * math.clamp(normalized, 0, 1)
+		if age <= SIGNAL_WINDOW_MULTI then
+			sourceCount += 1
+		end
 	end
-	if entry.lastSkillAt and now - entry.lastSkillAt <= window then
-		return true
+
+	apply(3.0, entry.lastSkillAt, SIGNAL_WINDOW_SKILL)
+	apply(2.5, entry.lastEffectAt, SIGNAL_WINDOW_EFFECT)
+	apply(2.0, entry.lastAnimAt, SIGNAL_WINDOW_ANIMATION)
+	apply(1.8, entry.lastPartAt, SIGNAL_WINDOW_PART)
+	apply(1.5, entry.lastSoundAt, SIGNAL_WINDOW_SOUND)
+
+	if sourceCount >= 2 then
+		confidence += 1.0
 	end
-	if entry.lastPartAt and now - entry.lastPartAt <= window then
-		return true
-	end
-	if entry.lastSoundAt and now - entry.lastSoundAt <= window then
-		return true
-	end
-	if entry.lastAttrAt and now - entry.lastAttrAt <= window then
-		return true
-	end
-	return false
+
+	return confidence
 end
 
 function Defender:cooldownAllow(timing)
@@ -1549,105 +1576,6 @@ function Defender:cooldownAllow(timing)
 	end
 	bucket[key] = now
 	return true
-end
-
-function Defender:hybridFallback(options, timing, action)
-	local entity = resolveSignalEntity(options)
-	if not entity then
-		return false
-	end
-	if not Defender.hasRecentSignal(entity) then
-		return false
-	end
-
-	local attackerPart = options and options.part
-	if not attackerPart then
-		if typeof(entity) == "Instance" and entity:IsA("Model") then
-			attackerPart = entity:FindFirstChild("HumanoidRootPart")
-				or entity:FindFirstChild("Torso")
-				or entity.PrimaryPart
-		elseif typeof(entity) == "Instance" and entity:IsA("BasePart") then
-			attackerPart = entity
-		end
-	end
-	if not attackerPart then
-		return false
-	end
-
-	local localRoot = getLocalRoot()
-	if not localRoot then
-		return false
-	end
-
-	local toLocal = localRoot.Position - attackerPart.Position
-	local dist = toLocal.Magnitude
-	local maxDist = Configuration.expectOptionValue("HybridMaxDistance") or 18
-	if dist > maxDist then
-		return false
-	end
-	local vertTol = Configuration.expectOptionValue("HybridVerticalTolerance") or 8
-	if math.abs(toLocal.Y) > vertTol then
-		return false
-	end
-	local minDot = Configuration.expectOptionValue("HybridMinDot") or 0.15
-	if dist > 0 then
-		local dir = toLocal.Unit
-		local facing = attackerPart.CFrame.LookVector
-		if facing:Dot(dir) < minDot then
-			return false
-		end
-	end
-
-	return true
-end
-
-function Defender:hybridCheck(options, timing, action, info)
-	if not options then
-		return false
-	end
-	timing = timing or options.timing
-	action = action or options.action
-
-	if action and action.ihbc then
-		return true
-	end
-
-	local skipHitbox = Configuration.expectToggleValue("IgnoreHitboxChecks")
-	if timing and timing.tag == "M1" and Configuration.expectToggleValue("IgnoreM1HitboxChecks") then
-		skipHitbox = true
-	end
-
-	if not skipHitbox then
-		if info then
-			if self:hc(options, info) then
-				return true
-			end
-		else
-			local basePtime = options.ptime
-			local sampleCount = math.clamp(Configuration.expectOptionValue("HitboxSampleCount") or 3, 1, 5)
-			local windowMs = Configuration.expectOptionValue("HitboxSampleWindowMs") or 90
-			local window = math.max(0, windowMs) / 1000
-			local step = sampleCount > 1 and (window / (sampleCount - 1)) or 0
-			local startOffset = -window / 2
-
-			for i = 1, sampleCount do
-				local offset = startOffset + (i - 1) * step
-				options.ptime = (basePtime or 0) + offset
-				if self:hc(options, nil) then
-					options.ptime = basePtime
-					return true
-				end
-			end
-
-			options.ptime = basePtime
-		end
-	end
-
-	if not Configuration.expectToggleValue("EnableHybridDefense") then
-		return false
-	end
-
-	return self:hybridFallback(options, timing, action)
 end
 
 ---Check if any parts that are in our filter were hit.
@@ -1920,6 +1848,10 @@ Defender.hc = LPH_NO_VIRTUALIZE(function(self, options, info)
 	local character = players.LocalPlayer.Character
 	if not character then
 		return false
+	end
+
+	if NO_HITBOX_ONLY then
+		return true
 	end
 
 	if Configuration.expectToggleValue("IgnoreHitboxChecks") then
@@ -2382,7 +2314,7 @@ SoundDefender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 	options.entity = self.owner or self.part
 	options.action = action
 
-	if not self:hybridCheck(options, timing, action, timing.duih and RepeatInfo.new(timing) or nil) then
+	if not self:hc(options, timing.duih and RepeatInfo.new(timing) or nil) then
 		return self:notify(timing, "Not in hitbox.")
 	end
 
@@ -2779,7 +2711,7 @@ PartDefender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 
 	if not self.timing.duih then
 		Defender.recordSignal(self.entity or self.part, "Part", timing and timing.name or "Part")
-		if not self:hybridCheck(options, timing, action, timing.duih and RepeatInfo.new(timing) or nil) then
+		if not self:hc(options, timing.duih and RepeatInfo.new(timing) or nil) then
 			return self:notify(timing, "Not in hitbox.")
 		end
 	end
@@ -2824,7 +2756,7 @@ PartDefender.update = LPH_NO_VIRTUALIZE(function(self)
 	end
 	options.hmid = self.hmid
 	Defender.recordSignal(self.entity or self.part, "Part", self.timing and self.timing.name or "Part")
-	local touching = self:hybridCheck(options, self.timing, nil, nil)
+	local touching = self:hc(options, nil)
 
 	if not touching then
 		return
@@ -4624,6 +4556,7 @@ local Library = require("GUI/Library")
 local AttributeListener = require("Features/Combat/AttributeListener")
 local Defender = require("Features/Combat/Objects/Defender")
 local HitboxOptions = require("Features/Combat/Objects/HitboxOptions")
+local Logger = require("Utility/Logger")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -4636,14 +4569,52 @@ local hitboxDefender = Defender.new()
 local clock = os.clock
 local pollActive = false
 local pollTask = nil
-local pollInterval = 0.1
-local NO_HITBOX_COOLDOWN = 0.1
-local MAX_NO_HITBOX_DELAY = 0.12
+local pollInterval = 0.03
+local NO_HITBOX_COOLDOWN = 0.035
+local MAX_NO_HITBOX_DELAY = 0.06
 local skillContext = {}
-local SKILL_LOCK_BASE = 0.22
+local SKILL_LOCK_BASE = 0.08
 local runSkillAction
 local skillDelaySeconds
 local fireNoHitbox
+
+local function profileMinConfidence()
+	local profile = Configuration.expectOptionValue("DefenseProfile")
+	if type(profile) ~= "string" or profile == "" then
+		profile = NO_HITBOX_PROFILE_DEFAULT
+	end
+	return NO_HITBOX_PROFILE_MIN_CONFIDENCE[profile]
+		or NO_HITBOX_PROFILE_MIN_CONFIDENCE[NO_HITBOX_PROFILE_DEFAULT]
+		or 2.0
+end
+
+local function noHitboxMinConfidence(rule)
+	if rule and type(rule.minConfidence) == "number" and rule.minConfidence > 0 then
+		return rule.minConfidence
+	end
+	local profileDefault = profileMinConfidence()
+	local configured = Configuration.expectOptionValue("NoHitboxMinConfidence")
+	if type(configured) == "number" and configured > 0 then
+		return math.max(configured, profileDefault)
+	end
+	return profileDefault
+end
+
+local function noHitboxReactionBiasSeconds()
+	local ms = Configuration.expectOptionValue("NoHitboxReactionBiasMs")
+	if type(ms) ~= "number" then
+		ms = -35
+	end
+	return ms / 1000
+end
+
+local function noHitboxSkillPollSeconds()
+	local ms = Configuration.expectOptionValue("NoHitboxSkillPollMs")
+	if type(ms) ~= "number" then
+		ms = pollInterval * 1000
+	end
+	return math.max(0.01, ms / 1000)
+end
 
 local function applyWorldOffset(cframe, offset)
 	if not offset or offset == Vector3.zero then
@@ -4691,6 +4662,9 @@ local function predictionSeconds()
 end
 
 local function passesHitbox(def, rule)
+	if NO_HITBOX_ONLY then
+		return true
+	end
 	if rule and rule.ihbc then
 		return true
 	end
@@ -4724,10 +4698,14 @@ local function passesHitbox(def, rule)
 	options.entity = def.character or root.Parent
 
 	local action = rule and rule.ihbc and { ihbc = true } or nil
-	return hitboxDefender:hybridCheck(options, timing, action, nil)
+	options.action = action
+	return hitboxDefender:hc(options, nil)
 end
 
 local function passesHitboxRaw(def, rule)
+	if NO_HITBOX_ONLY then
+		return true
+	end
 	local hitbox = rule.hitbox
 	if typeof(hitbox) ~= "Vector3" then
 		return true
@@ -4757,7 +4735,8 @@ local function passesHitboxRaw(def, rule)
 	options.entity = def.character or root.Parent
 
 	local action = rule and rule.ihbc and { ihbc = true } or nil
-	return hitboxDefender:hybridCheck(options, timing, action, nil)
+	options.action = action
+	return hitboxDefender:hc(options, nil)
 end
 
 local function blockAcquire()
@@ -4877,8 +4856,12 @@ local function jumpTwice()
 end
 
 local function blockFor(seconds)
-	if seconds and seconds > 0 then
-		InputClient.blockHoldSeconds(seconds)
+	local hold = seconds or 0
+	if hold <= 0 and NO_HITBOX_ONLY then
+		hold = Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+	end
+	if hold > 0 then
+		InputClient.blockHoldSeconds(hold)
 	end
 end
 
@@ -5171,11 +5154,13 @@ local function deferHitboxAction(def, key, rule, delaySeconds, callback)
 		if not passesDistance(def, rule) then
 			return
 		end
-		if not passesHitbox(def, rule) then
-			return
-		end
 		if type(callback) == "function" then
-			callback()
+			local ok, err = pcall(function()
+				executeDefensiveAction(def, rule, callback)
+			end)
+			if not ok then
+				Logger.warn("UsingSkill deferred callback failed: %s", tostring(err))
+			end
 		end
 	end)
 	return true
@@ -5303,6 +5288,40 @@ local function updateOwner(def)
 	def.player = character and Players:GetPlayerFromCharacter(character) or nil
 end
 
+local function safeRuleStart(def, rule, lowerValue, compactValue)
+	local ok, err = pcall(function()
+		executeDefensiveAction(def, rule, function()
+			return rule.onStart(def, lowerValue, compactValue)
+		end)
+	end)
+	if not ok then
+		Logger.warn("UsingSkill onStart failed: %s", tostring(err))
+	end
+end
+
+local function executeRuleOnStart(def, key, rule, lowerValue, compactValue)
+	if not def or not rule or type(rule.onStart) ~= "function" then
+		return
+	end
+
+	if rule.ihbc then
+		if fireNoHitbox then
+			fireNoHitbox(def, key, rule, lowerValue, compactValue)
+		else
+			safeRuleStart(def, rule, lowerValue, compactValue)
+		end
+		return
+	end
+
+	if runSkillAction then
+		runSkillAction(def, key, rule, lowerValue, compactValue, function()
+			safeRuleStart(def, rule, lowerValue, compactValue)
+		end)
+	else
+		safeRuleStart(def, rule, lowerValue, compactValue)
+	end
+end
+
 function UsingSkillWatcher.update(def)
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
 		return
@@ -5397,7 +5416,8 @@ function UsingSkillWatcher.update(def)
 			tokenMatched = false
 		end
 		local isDeferred = rule.deferHitboxSeconds and rule.deferHitboxSeconds > 0
-		local hitboxMatched = tokenMatched and passesDistance(def, rule) and passesHitbox(def, rule)
+		local distanceMatched = tokenMatched and passesDistance(def, rule)
+		local ruleMatched = distanceMatched and (NO_HITBOX_ONLY or passesHitbox(def, rule))
 		local wasActive = def.states[key] == true
 		local hitboxWasActive = info.hitboxActive == true
 
@@ -5408,23 +5428,7 @@ function UsingSkillWatcher.update(def)
 				handleAutoCounterTiming({ tag = "Skill" }, "SkillWatcher", hitboxDefender:distance(def.character))
 			end
 			if isDeferred and type(rule.onStart) == "function" then
-				if rule.ihbc then
-					fireNoHitbox(def, key, rule, lowerValue, compactValue)
-				else
-					if runSkillAction then
-						runSkillAction(def, key, rule, lowerValue, compactValue, function()
-							local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
-							if not ok then
-								Logger.warn("UsingSkill onStart failed: %s", tostring(err))
-							end
-						end)
-					else
-						local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
-						if not ok then
-							Logger.warn("UsingSkill onStart failed: %s", tostring(err))
-						end
-					end
-				end
+				executeRuleOnStart(def, key, rule, lowerValue, compactValue)
 			end
 		elseif not tokenMatched and wasActive then
 			def.states[key] = false
@@ -5438,39 +5442,14 @@ function UsingSkillWatcher.update(def)
 		end
 
 		if tokenMatched and not isDeferred then
-			if hitboxMatched and not hitboxWasActive then
+			if ruleMatched and not hitboxWasActive then
 				info.hitboxActive = true
-				if type(rule.onStart) == "function" then
-					if rule.ihbc then
-						if fireNoHitbox then
-							fireNoHitbox(def, key, rule, lowerValue, compactValue)
-						else
-							local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
-							if not ok then
-								Logger.warn("UsingSkill onStart failed: %s", tostring(err))
-							end
-						end
-					else
-						if runSkillAction then
-							runSkillAction(def, key, rule, lowerValue, compactValue, function()
-								local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
-								if not ok then
-									Logger.warn("UsingSkill onStart failed: %s", tostring(err))
-								end
-							end)
-						else
-							local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
-							if not ok then
-								Logger.warn("UsingSkill onStart failed: %s", tostring(err))
-							end
-						end
-					end
-				end
-			elseif hitboxMatched and hitboxWasActive then
+				executeRuleOnStart(def, key, rule, lowerValue, compactValue)
+			elseif ruleMatched and hitboxWasActive then
 				if type(rule.onTick) == "function" then
 					rule.onTick(def, lowerValue, compactValue)
 				end
-			elseif not hitboxMatched and hitboxWasActive then
+			elseif not ruleMatched and hitboxWasActive then
 				info.hitboxActive = false
 			end
 		end
@@ -5609,7 +5588,8 @@ function UsingSkillWatcher.init()
 		pollActive = true
 		pollTask = task.spawn(LPH_NO_VIRTUALIZE(function()
 			while pollActive do
-				task.wait(pollInterval)
+				local interval = NO_HITBOX_ONLY and noHitboxSkillPollSeconds() or pollInterval
+				task.wait(interval)
 				for _, def in pairs(usingSkillDefs) do
 					UsingSkillWatcher.update(def)
 				end
@@ -5629,7 +5609,8 @@ function UsingSkillWatcher.init()
 end
 
 skillDelaySeconds = function()
-	return math.clamp(Defender.rdelay(), 0, MAX_NO_HITBOX_DELAY)
+	local biased = Defender.rdelay() + noHitboxReactionBiasSeconds()
+	return math.clamp(math.max(0, biased), 0, MAX_NO_HITBOX_DELAY)
 end
 
 local function getSkillContext(def)
@@ -5657,11 +5638,11 @@ local function defaultCooldownMs(rule)
 	end
 	local prio = defaultPriority(rule)
 	if prio <= 1 then
-		return 80
+		return 40
 	elseif prio == 2 then
-		return 120
+		return 70
 	end
-	return 180
+	return 110
 end
 
 runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
@@ -5676,6 +5657,13 @@ runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
 	local prio = defaultPriority(rule)
 	if ctx.lockUntil and now < ctx.lockUntil and prio < (ctx.lockPriority or 0) then
 		return
+	end
+	if NO_HITBOX_ONLY then
+		local confidence = Defender.getSignalConfidence and Defender.getSignalConfidence(def.character, "Skill") or 0
+		local minConfidence = noHitboxMinConfidence(rule)
+		if confidence < minConfidence then
+			return
+		end
 	end
 	local cdMs = defaultCooldownMs(rule)
 	local last = ctx.lastSkillAt[key]
@@ -5705,7 +5693,8 @@ runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
 end
 
 local function noHitboxDelaySeconds()
-	return math.clamp(Defender.rdelay(), 0, MAX_NO_HITBOX_DELAY)
+	local biased = Defender.rdelay() + noHitboxReactionBiasSeconds()
+	return math.clamp(math.max(0, biased), 0, MAX_NO_HITBOX_DELAY)
 end
 
 fireNoHitbox = function(def, key, rule, lowerValue, compactValue)
@@ -5725,7 +5714,11 @@ fireNoHitbox = function(def, key, rule, lowerValue, compactValue)
 	end
 	info.nhLast = now
 	local function safeStart()
-		local ok, err = pcall(rule.onStart, def, lowerValue, compactValue)
+		local ok, err = pcall(function()
+			executeDefensiveAction(def, rule, function()
+				return rule.onStart(def, lowerValue, compactValue)
+			end)
+		end)
 		if not ok then
 			Logger.warn("UsingSkill onStart failed: %s", tostring(err))
 		end
@@ -20837,7 +20830,7 @@ function Library:AddUsingSkillEntry(playerName, skillValue, isLocal, state, dura
 				local userInputService = game:GetService("UserInputService")
 				local chatInputBarConfiguration = textChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
 
-				if userInputService:GetFocusedTextBox() or chatInputBarConfiguration.IsFocused then
+				if userInputService:GetFocusedTextBox() or (chatInputBarConfiguration and chatInputBarConfiguration.IsFocused) then
 					return
 				end
 
@@ -26047,48 +26040,20 @@ autoDefenseDepBox:AddToggle("EnableVisualizations", {
 	Text = "Enable Visualizations",
 	Default = false,
 })
-autoDefenseDepBox:AddToggle("IgnoreHitboxChecks", {
+local ignoreHitboxToggle = autoDefenseDepBox:AddToggle("IgnoreHitboxChecks", {
 	Text = "Ignore Hitbox Checks",
 	Default = true,
 	Tooltip = "Skips hitbox checks; timing distance limits still apply.",
 })
-autoDefenseDepBox:AddToggle("IgnoreM1HitboxChecks", {
+local ignoreM1HitboxToggle = autoDefenseDepBox:AddToggle("IgnoreM1HitboxChecks", {
 	Text = "Ignore M1 Hitbox Checks",
-	Default = false,
+	Default = true,
 	Tooltip = "Skips hitbox checks for M1 timings only.",
 })
 autoDefenseDepBox:AddToggle("UseControllerM1", {
 	Text = "Use Controller M1 (VIM)",
 	Default = false,
 	Tooltip = "Send controller M1 (ButtonR2) instead of mouse clicks.",
-})
-autoDefenseDepBox:AddToggle("EnableHybridDefense", {
-	Text = "Enable Hybrid Defense",
-	Default = true,
-})
-autoDefenseDepBox:AddSlider("HybridMaxDistance", {
-	Text = "Hybrid Max Distance",
-	Min = 0,
-	Max = 50,
-	Default = 18,
-	Suffix = "studs",
-	Rounding = 1,
-})
-autoDefenseDepBox:AddSlider("HybridMinDot", {
-	Text = "Hybrid Min Dot",
-	Min = 0,
-	Max = 1,
-	Default = 0.15,
-	Rounding = 2,
-	Tooltip = "Lower = more permissive angle.",
-})
-autoDefenseDepBox:AddSlider("HybridVerticalTolerance", {
-	Text = "Hybrid Vertical Tolerance",
-	Min = 0,
-	Max = 20,
-	Default = 8,
-	Suffix = "studs",
-	Rounding = 1,
 })
 autoDefenseDepBox:AddSlider("HitboxSampleCount", {
 	Text = "Hitbox Sample Count",
@@ -26218,7 +26183,7 @@ autoDefenseDepBox:AddSlider("BlockHoldSeconds", {
 	Text = "Block Hold Seconds",
 	Min = 0,
 	Max = 2,
-	Default = 0.25,
+	Default = 0.4,
 	Suffix = "s",
 	Rounding = 2,
 })
@@ -26231,9 +26196,79 @@ autoDefenseDepBox:AddSlider("ReactionDelaySeconds", {
 	Rounding = 2,
 	Tooltip = "Delay before auto-defense inputs.",
 })
+autoDefenseDepBox:AddDropdown("DefenseProfile", {
+	Text = "Defense Profile",
+	Values = { "Max Survival", "Balanced", "Low Noise" },
+	Default = NO_HITBOX_PROFILE_DEFAULT,
+})
+autoDefenseDepBox:AddSlider("NoHitboxMinConfidence", {
+	Text = "No-Hitbox Min Confidence",
+	Min = 0,
+	Max = 6,
+	Default = 2.0,
+	Rounding = 2,
+})
+autoDefenseDepBox:AddSlider("NoHitboxReactionBiasMs", {
+	Text = "No-Hitbox Reaction Bias",
+	Min = -150,
+	Max = 150,
+	Default = -35,
+	Suffix = "ms",
+	Rounding = 0,
+})
+autoDefenseDepBox:AddSlider("NoHitboxSkillPollMs", {
+	Text = "No-Hitbox Skill Poll",
+	Min = 10,
+	Max = 200,
+	Default = 30,
+	Suffix = "ms",
+	Rounding = 0,
+})
+autoDefenseDepBox:AddSlider("NoHitboxPartPollMs", {
+	Text = "No-Hitbox Part Poll",
+	Min = 10,
+	Max = 250,
+	Default = 40,
+	Suffix = "ms",
+	Rounding = 0,
+})
+autoDefenseDepBox:AddSlider("NoHitboxMinBlockSeconds", {
+	Text = "No-Hitbox Min Block",
+	Min = 0.05,
+	Max = 2.0,
+	Default = 0.35,
+	Suffix = "s",
+	Rounding = 2,
+})
 autoDefenseDepBox:SetupDependencies({
 	{ autoDefenseToggle, true },
 })
+
+local function enforceNoHitboxToggles()
+	if not NO_HITBOX_ONLY then
+		return
+	end
+	if ignoreHitboxToggle and ignoreHitboxToggle.Value ~= true then
+		ignoreHitboxToggle:SetValue(true)
+	end
+	if ignoreM1HitboxToggle and ignoreM1HitboxToggle.Value ~= true then
+		ignoreM1HitboxToggle:SetValue(true)
+	end
+end
+
+ignoreHitboxToggle:OnChanged(function(value)
+	if NO_HITBOX_ONLY and value ~= true then
+		task.defer(enforceNoHitboxToggles)
+	end
+end)
+
+ignoreM1HitboxToggle:OnChanged(function(value)
+	if NO_HITBOX_ONLY and value ~= true then
+		task.defer(enforceNoHitboxToggles)
+	end
+end)
+
+task.defer(enforceNoHitboxToggles)
 
 local m1TradeTab = window:AddTab("M1 Auto Trade")
 local m1TradeGroup = m1TradeTab:AddLeftGroupbox("M1 Auto Trade")
@@ -28333,7 +28368,7 @@ if Options["AutoComboStopKeybind"] then
 	end)
 end
 
-local activeSkillDef = nil
+activeSkillDef = nil
 
 local function chooseDashDir(def, dir)
 	if not def or not dir then
@@ -28370,6 +28405,11 @@ local function chooseDashDir(def, dir)
 	return dir
 end
 local blockFor
+local defenseActionState = {
+	blockIssued = 0,
+	dashAttempt = 0,
+	dashOk = true,
+}
 
 local function dash(dir)
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
@@ -28380,10 +28420,15 @@ local function dash(dir)
 		def = dir
 		dir = nil
 	end
+	local unresolved = type(dir) ~= "string" or dir == ""
 	if def and dir then
 		dir = chooseDashDir(def, dir)
+		unresolved = type(dir) ~= "string" or dir == ""
 	end
-	return InputClient.dash(dir)
+	defenseActionState.dashAttempt = (defenseActionState.dashAttempt or 0) + 1
+	local ok = InputClient.dash(dir)
+	defenseActionState.dashOk = (ok == true) and not unresolved
+	return ok
 end
 
 local function dashAfter(seconds, dir)
@@ -28416,9 +28461,34 @@ local function jumpTwice(delaySeconds)
 	end)
 end
 
-local function trackHitboxWindow(def, key, rule, delaySeconds, windowSeconds, intervalSeconds, callback)
+executeDefensiveAction = function(def, rule, actionFn)
+	if type(actionFn) ~= "function" then
+		return nil
+	end
+	local _ = def
+	local beforeBlock = defenseActionState.blockIssued or 0
+	local beforeDash = defenseActionState.dashAttempt or 0
+	local result = actionFn()
+	local afterBlock = defenseActionState.blockIssued or 0
+	local afterDash = defenseActionState.dashAttempt or 0
+	local needsFallback = false
+	if afterBlock <= beforeBlock then
+		needsFallback = true
+	end
+	if afterDash > beforeDash and defenseActionState.dashOk == false then
+		needsFallback = true
+	end
+	if needsFallback then
+		local minBlock = (rule and rule.minBlockSeconds) or Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+		blockFor(math.max(minBlock, 0.05))
+	end
+	return result
+end
+
+local function trackSignalWindow(def, key, rule, delaySeconds, windowSeconds, intervalSeconds, callback)
 	local delay = delaySeconds or 0
 	local window = windowSeconds or 0
+	local _ = intervalSeconds
 	if window <= 0 then
 		return false
 	end
@@ -28428,7 +28498,20 @@ local function trackHitboxWindow(def, key, rule, delaySeconds, windowSeconds, in
 	end
 	info.trackToken = (info.trackToken or 0) + 1
 	local token = info.trackToken
-	local delayWithPing = delay + (skillDelaySeconds and skillDelaySeconds() or 0)
+	local extraDelay = 0
+	if type(skillDelaySeconds) == "function" then
+		extraDelay = skillDelaySeconds()
+	else
+		local defenderModule = require("Features/Combat/Objects/Defender")
+		local baseDelay = type(defenderModule) == "table" and type(defenderModule.rdelay) == "function" and defenderModule.rdelay()
+			or 0
+		local biasMs = Configuration.expectOptionValue("NoHitboxReactionBiasMs")
+		if type(biasMs) ~= "number" then
+			biasMs = -35
+		end
+		extraDelay = math.clamp(math.max(0, baseDelay + (biasMs / 1000)), 0, 0.06)
+	end
+	local delayWithPing = delay + extraDelay
 	task.delay(delayWithPing, LPH_NO_VIRTUALIZE(function()
 		if not Configuration.expectToggleValue("EnableAutoDefense") then
 			return
@@ -28436,32 +28519,23 @@ local function trackHitboxWindow(def, key, rule, delaySeconds, windowSeconds, in
 		if info.trackToken ~= token then
 			return
 		end
-		local deadline = os.clock() + window
-		local interval = intervalSeconds or pollInterval
-		while os.clock() <= deadline do
-			if not Configuration.expectToggleValue("EnableAutoDefense") then
-				return
-			end
-			if info.trackToken ~= token then
-				return
-			end
-			if UsingSkillWatcher._allowActions and not UsingSkillWatcher._allowActions("Skill") then
-				return
-			end
-			if UsingSkillWatcher._passesDistance and not UsingSkillWatcher._passesDistance(def, rule) then
-				return
-			end
-			if UsingSkillWatcher._passesHitboxRaw and UsingSkillWatcher._passesHitboxRaw(def, rule) then
-				if type(callback) == "function" then
-					if runSkillAction then
-						runSkillAction(def, key, rule, def.lastValue, def.lastValue, callback)
-					else
-						callback()
-					end
+		if UsingSkillWatcher._allowActions and not UsingSkillWatcher._allowActions("Skill") then
+			return
+		end
+		if UsingSkillWatcher._passesDistance and not UsingSkillWatcher._passesDistance(def, rule) then
+			return
+		end
+		if type(callback) == "function" then
+			local ok, err = pcall(function()
+				executeDefensiveAction(def, rule, callback)
+			end)
+			if not ok then
+				if Logger and Logger.warn then
+					Logger.warn("SignalWindow callback failed: %s", tostring(err))
+				else
+					warn(string.format("[SignalWindow] callback failed: %s", tostring(err)))
 				end
-				return
 			end
-			task.wait(interval)
 		end
 	end))
 	return true
@@ -28517,12 +28591,20 @@ local PART_METERS_TO_STUDS = 3.57
 local partPulseActive = false
 local partPulseTask = nil
 local partLastActionAt = {}
-local PART_ACTION_COOLDOWN = 0.4
+local PART_ACTION_COOLDOWN = 0.25
 local babylonGateCounts = {}
 local BABYLON_M1_BLOCK_SECONDS = 0.3
 local BABYLON_M1_RESET_SECONDS = 3.0
 local BABYLON_M1_TRIGGER_COUNT = 5
 local BABYLON_MULTIPLE_THRESHOLD = 2
+
+local function noHitboxPartPollSeconds()
+	local ms = Configuration.expectOptionValue("NoHitboxPartPollMs")
+	if type(ms) ~= "number" then
+		ms = 40
+	end
+	return math.max(0.01, ms / 1000)
+end
 
 local function localRootPart()
 	local character = LocalPlayer and LocalPlayer.Character
@@ -28770,7 +28852,7 @@ local function startPartPulse()
 	partPulseActive = true
 	partPulseTask = task.spawn(LPH_NO_VIRTUALIZE(function()
 		while partPulseActive do
-			task.wait(0.12)
+			task.wait(NO_HITBOX_ONLY and noHitboxPartPollSeconds() or 0.12)
 			if not Configuration.expectToggleValue("EnableAutoDefense") then
 				continue
 			end
@@ -28792,7 +28874,12 @@ blockFor = function(seconds)
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
 		return false
 	end
-	return UsingSkillWatcher.blockHoldSeconds(seconds)
+	local hold = seconds or 0
+	if hold <= 0 then
+		hold = Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+	end
+	defenseActionState.blockIssued = (defenseActionState.blockIssued or 0) + 1
+	return UsingSkillWatcher.blockHoldSeconds(hold)
 end
 
 local function dashThenBlock(dir, seconds, parallel)
@@ -28886,7 +28973,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(11, 12.5, 200),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Kamehameha", UsingSkillWatcher.rules.Kamehameha, 0, 0.6, 0.05, function()
+			trackSignalWindow(def, "Kamehameha", UsingSkillWatcher.rules.Kamehameha, 0, 0.6, 0.05, function()
 				InputClient.jump()
 				dash("right")
 			end)
@@ -29100,7 +29187,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 30),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "ComboBlitz", UsingSkillWatcher.rules.ComboBlitz, 0, 2.0, 0.05, function()
+			trackSignalWindow(def, "ComboBlitz", UsingSkillWatcher.rules.ComboBlitz, 0, 2.0, 0.05, function()
 				blockFor(2.9)
 			end)
 		end,
@@ -29112,7 +29199,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(45, 45, 45),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "ExplosiveField", UsingSkillWatcher.rules.ExplosiveField, 0.35, 0.8, 0.05, function()
+			trackSignalWindow(def, "ExplosiveField", UsingSkillWatcher.rules.ExplosiveField, 0.35, 0.8, 0.05, function()
 				dash("back")
 			end)
 		end,
@@ -29180,7 +29267,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(45, 45, 45),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "ElbowKick", UsingSkillWatcher.rules.ElbowKick, 0, 1.7, 0.05, function()
+			trackSignalWindow(def, "ElbowKick", UsingSkillWatcher.rules.ElbowKick, 0, 1.7, 0.05, function()
 				blockFor(1.4)
 			end)
 		end,
@@ -29192,7 +29279,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 16, 120),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "KameBlast", UsingSkillWatcher.rules.KameBlast, 0, 2.0, 0.05, function()
+			trackSignalWindow(def, "KameBlast", UsingSkillWatcher.rules.KameBlast, 0, 2.0, 0.05, function()
 				InputClient.jump()
 				task.defer(dash, "right")
 				task.delay(0.3, function()
@@ -29208,7 +29295,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(17, 24, 20),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "RapidKickRush", UsingSkillWatcher.rules.RapidKickRush, 0.297, 1.0, 0.05, function()
+			trackSignalWindow(def, "RapidKickRush", UsingSkillWatcher.rules.RapidKickRush, 0.297, 1.0, 0.05, function()
 				jumpTwice()
 				task.defer(dash, "back")
 			end)
@@ -29221,7 +29308,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(18, 20, 180),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "CosmicRush", UsingSkillWatcher.rules.CosmicRush, 0, 1.2, 0.05, function()
+			trackSignalWindow(def, "CosmicRush", UsingSkillWatcher.rules.CosmicRush, 0, 1.2, 0.05, function()
 				blockFor(0.95)
 			end)
 		end,
@@ -29232,7 +29319,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 120),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Grab", UsingSkillWatcher.rules.Grab, 0.455, 1.3, 0.05, function()
+			trackSignalWindow(def, "Grab", UsingSkillWatcher.rules.Grab, 0.455, 1.3, 0.05, function()
 				blockFor(1.1)
 			end)
 		end,
@@ -29244,7 +29331,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "PunchOnslaught", UsingSkillWatcher.rules.PunchOnslaught, 0, 1.7, 0.05, function()
+			trackSignalWindow(def, "PunchOnslaught", UsingSkillWatcher.rules.PunchOnslaught, 0, 1.7, 0.05, function()
 				dash("back")
 				task.delay(0.4, function()
 					blockFor(1.125)
@@ -29259,7 +29346,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 100),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "FastFlashAttack", UsingSkillWatcher.rules.FastFlashAttack, 0, 0.3, 0.05, function()
+			trackSignalWindow(def, "FastFlashAttack", UsingSkillWatcher.rules.FastFlashAttack, 0, 0.3, 0.05, function()
 				blockFor(0.9)
 			end)
 		end,
@@ -29271,7 +29358,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(25, 15, 120),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "FinalStrike", UsingSkillWatcher.rules.FinalStrike, 0.371, 1.2, 0.05, function()
+			trackSignalWindow(def, "FinalStrike", UsingSkillWatcher.rules.FinalStrike, 0.371, 1.2, 0.05, function()
 				dash("right")
 			end)
 		end,
@@ -29283,7 +29370,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(12, 12, 45),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "PunisherDrive", UsingSkillWatcher.rules.PunisherDrive, 0.07, 0.3, 0.05, function()
+			trackSignalWindow(def, "PunisherDrive", UsingSkillWatcher.rules.PunisherDrive, 0.07, 0.3, 0.05, function()
 				blockFor(1.2)
 			end)
 		end,
@@ -29325,7 +29412,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "HeavyBlow", UsingSkillWatcher.rules.HeavyBlow, 0, 0.9, 0.05, function()
+			trackSignalWindow(def, "HeavyBlow", UsingSkillWatcher.rules.HeavyBlow, 0, 0.9, 0.05, function()
 				dash("back")
 			end)
 		end,
@@ -29337,7 +29424,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 45),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "PowerRoar", UsingSkillWatcher.rules.PowerRoar, 0, 0.8, 0.05, function()
+			trackSignalWindow(def, "PowerRoar", UsingSkillWatcher.rules.PowerRoar, 0, 0.8, 0.05, function()
 				jumpTwice()
 				task.defer(dash, "right")
 			end)
@@ -29350,7 +29437,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 60),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "WraithfulCrash", UsingSkillWatcher.rules.WraithfulCrash, 0, 1.2, 0.05, function()
+			trackSignalWindow(def, "WraithfulCrash", UsingSkillWatcher.rules.WraithfulCrash, 0, 1.2, 0.05, function()
 				blockFor(1.2)
 			end)
 		end,
@@ -29361,7 +29448,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(40, 40, 80),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Skill_1731404034", UsingSkillWatcher.rules.Skill_1731404034, 0.14, 0.6, 0.05, function()
+			trackSignalWindow(def, "Skill_1731404034", UsingSkillWatcher.rules.Skill_1731404034, 0.14, 0.6, 0.05, function()
 				blockFor(1.2)
 			end)
 		end,
@@ -29372,7 +29459,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 60),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Skill_92993354909172", UsingSkillWatcher.rules.Skill_92993354909172, 0.26, 1.2, 0.05, function()
+			trackSignalWindow(def, "Skill_92993354909172", UsingSkillWatcher.rules.Skill_92993354909172, 0.26, 1.2, 0.05, function()
 				blockFor(1.2)
 			end)
 		end,
@@ -29383,7 +29470,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Skill_1886062099", UsingSkillWatcher.rules.Skill_1886062099, 0, 0.9, 0.05, function()
+			trackSignalWindow(def, "Skill_1886062099", UsingSkillWatcher.rules.Skill_1886062099, 0, 0.9, 0.05, function()
 				dash("back")
 			end)
 		end,
@@ -29395,7 +29482,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 40),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "FritAssorti", UsingSkillWatcher.rules.FritAssorti, 0, 1.2, 0.05, function()
+			trackSignalWindow(def, "FritAssorti", UsingSkillWatcher.rules.FritAssorti, 0, 1.2, 0.05, function()
 				task.delay(0.6, function()
 					dash("right")
 				end)
@@ -29408,7 +29495,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Spectre", UsingSkillWatcher.rules.Spectre, 0, 1.25, 0.05, function()
+			trackSignalWindow(def, "Spectre", UsingSkillWatcher.rules.Spectre, 0, 1.25, 0.05, function()
 				task.defer(dash, "back")
 				blockFor(1.6)
 			end)
@@ -29421,7 +29508,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(45, 45, 45),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "TableParty", UsingSkillWatcher.rules.TableParty, 0, 1.5, 0.05, function()
+			trackSignalWindow(def, "TableParty", UsingSkillWatcher.rules.TableParty, 0, 1.5, 0.05, function()
 				blockFor(1.4)
 			end)
 		end,
@@ -29432,7 +29519,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Skill_10006551970", UsingSkillWatcher.rules.Skill_10006551970, 0.307, 1.1, 0.05, function()
+			trackSignalWindow(def, "Skill_10006551970", UsingSkillWatcher.rules.Skill_10006551970, 0.307, 1.1, 0.05, function()
 				jumpTwice()
 				task.defer(dash, "right")
 			end)
@@ -29464,7 +29551,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 15),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Gatling", UsingSkillWatcher.rules.Gatling, 0, 1.5, 0.05, function()
+			trackSignalWindow(def, "Gatling", UsingSkillWatcher.rules.Gatling, 0, 1.5, 0.05, function()
 				task.defer(dash, "back")
 				blockFor(2.2)
 			end)
@@ -29486,7 +29573,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 35),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Skill_1731336080", UsingSkillWatcher.rules.Skill_1731336080, 0.159, 1.0, 0.05, function()
+			trackSignalWindow(def, "Skill_1731336080", UsingSkillWatcher.rules.Skill_1731336080, 0.159, 1.0, 0.05, function()
 				dash("right")
 			end)
 		end,
@@ -29497,7 +29584,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(15, 15, 120),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Bazooka", UsingSkillWatcher.rules.Bazooka, 0, 1.2, 0.05, function()
+			trackSignalWindow(def, "Bazooka", UsingSkillWatcher.rules.Bazooka, 0, 1.2, 0.05, function()
 				dashAfter(0.645, "right")
 			end)
 		end,
@@ -29539,7 +29626,7 @@ UsingSkillWatcher.setRules({
 		offset = Vector3.new(0, 0, 20),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "Saikuru", UsingSkillWatcher.rules.Saikuru, 0, 0.4, 0.05, function()
+			trackSignalWindow(def, "Saikuru", UsingSkillWatcher.rules.Saikuru, 0, 0.4, 0.05, function()
 				dash("back")
 			end)
 		end,
@@ -29551,7 +29638,7 @@ UsingSkillWatcher.setRules({
 		hitbox = Vector3.new(24, 24, 24),
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "SpinningMeteor", UsingSkillWatcher.rules.SpinningMeteor, 0, 1.2, 0.05, function()
+			trackSignalWindow(def, "SpinningMeteor", UsingSkillWatcher.rules.SpinningMeteor, 0, 1.2, 0.05, function()
 				dash("back")
 			end)
 		end,
@@ -29784,7 +29871,7 @@ UsingSkillWatcher.setRules({
 		ihbc = true,
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "DeathBeam", UsingSkillWatcher.rules.DeathBeam, 0, 0.8, 0.05, function()
+			trackSignalWindow(def, "DeathBeam", UsingSkillWatcher.rules.DeathBeam, 0, 0.8, 0.05, function()
 				InputClient.jump()
 				task.defer(dash, "right")
 			end)
@@ -29798,7 +29885,7 @@ UsingSkillWatcher.setRules({
 		ihbc = true,
 		fhb = true,
 		onStart = function(def)
-			trackHitboxWindow(def, "TailSlam", UsingSkillWatcher.rules.TailSlam, 0.4, 0.9, 0.05, function()
+			trackSignalWindow(def, "TailSlam", UsingSkillWatcher.rules.TailSlam, 0.4, 0.9, 0.05, function()
 				blockFor(1.2)
 			end)
 		end,
@@ -29823,8 +29910,13 @@ UsingSkillWatcher.setRules({
 			if info.genkiBlockUntil and os.clock() < info.genkiBlockUntil then
 				return
 			end
+			local root = localRootPart()
+			if not root then
+				return
+			end
 			for _, part in ipairs(iterGenkiCgaBrown()) do
-				if partHitboxMatches(part, Vector3.new(34, 34, 34), "Ball", Vector3.zero) then
+				local radius = math.max(17, math.max(part.Size.X, part.Size.Y, part.Size.Z) * 0.5)
+				if (part.Position - root.Position).Magnitude <= (radius + 4) then
 					blockFor(1.2)
 					info.genkiBlockUntil = os.clock() + 1.2
 					return
