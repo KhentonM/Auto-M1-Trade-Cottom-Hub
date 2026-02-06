@@ -13,26 +13,17 @@ _G.PP_SCRAMBLE_RE_NUM = _G.PP_SCRAMBLE_RE_NUM or PP_SCRAMBLE_RE_NUM
 shared = shared or {}
 shared.Lycoris = shared.Lycoris or { silent = false }
 local NO_HITBOX_ONLY = true
-local NO_HITBOX_PROFILE_DEFAULT = "Max Survival"
-local NO_HITBOX_PROFILE_MIN_CONFIDENCE = {
-	["Max Survival"] = 2.0,
-	["Balanced"] = 2.8,
-	["Low Noise"] = 3.8,
-}
+local NO_HITBOX_REACTION_BIAS_SECONDS = -0.045
+local NO_HITBOX_SKILL_POLL_SECONDS = 0.015
+local NO_HITBOX_PART_POLL_SECONDS = 0.03
+local NO_HITBOX_MIN_BLOCK_SECONDS = 0.35
+local NO_HITBOX_ACTIVE_GUARD_PULSE_SECONDS = 0.18
 local activeSkillDef = nil
 local executeDefensiveAction = function(_, _, actionFn)
 	if type(actionFn) == "function" then
 		return actionFn()
 	end
 	return nil
-end
-if not shared.Lycoris.DefenseSignals then
-	shared.Lycoris.DefenseSignals = setmetatable({}, { __mode = "k" })
-else
-	local mt = getmetatable(shared.Lycoris.DefenseSignals)
-	if not mt or mt.__mode ~= "k" then
-		setmetatable(shared.Lycoris.DefenseSignals, { __mode = "k" })
-	end
 end
 
 local handleAutoCounterTiming = function() end
@@ -589,7 +580,8 @@ local PREDICT_FACING_DELTA = 0.3
 ---@return boolean
 AnimatorDefender.stopped = LPH_NO_VIRTUALIZE(function(self, track, timing)
 	if
-		Configuration.expectToggleValue("AllowFailure")
+		not NO_HITBOX_ONLY
+		and Configuration.expectToggleValue("AllowFailure")
 		and not timing.rpue
 		and Random.new():NextNumber(1.0, 100.0) <= (Configuration.expectOptionValue("IgnoreAnimationEndRate") or 0.0)
 	then
@@ -974,8 +966,6 @@ AnimatorDefender.process = LPH_NO_VIRTUALIZE(function(self, track)
 		return
 	end
 
-	Defender.recordSignal(self.entity, "Animation", aid)
-
 	if ilr then
 		Library:AddExistAnimEntry(self.entity.Name, distance, timing)
 	end
@@ -1042,7 +1032,8 @@ AnimatorDefender.process = LPH_NO_VIRTUALIZE(function(self, track)
 	-- We need to check if we can atleast dash, because we will be going to are fallback.
 	-- We must also check if our action isn't too short or is not a parry type, defeating the purpose.
 	if
-		Configuration.expectToggleValue("AllowFailure")
+		not NO_HITBOX_ONLY
+		and Configuration.expectToggleValue("AllowFailure")
 		and not timing.rpue
 		and timing.actions:count() == 1
 		and Random.new():NextNumber(1.0, 100.0) <= (Configuration.expectOptionValue("FakeMistimeRate") or 0.0)
@@ -1216,30 +1207,7 @@ local PREDICTION_SPEED_REF = 16
 local PREDICTION_MIN_SCALE = 0.6
 local PREDICTION_MAX_SCALE = 1.4
 local blockTagCounter = 0
-local SIGNAL_WINDOW_SKILL = 0.50
-local SIGNAL_WINDOW_EFFECT = 0.35
-local SIGNAL_WINDOW_ANIMATION = 0.30
-local SIGNAL_WINDOW_PART = 0.26
-local SIGNAL_WINDOW_SOUND = 0.22
-local SIGNAL_WINDOW_MULTI = 0.12
-
-local defenseSignals = (shared and shared.Lycoris and shared.Lycoris.DefenseSignals) or setmetatable({}, { __mode = "k" })
-if shared and shared.Lycoris then
-	shared.Lycoris.DefenseSignals = defenseSignals
-end
 local defenseCooldowns = setmetatable({}, { __mode = "k" })
-
-local function signalEntry(entity)
-	if not entity then
-		return nil
-	end
-	local entry = defenseSignals[entity]
-	if not entry then
-		entry = {}
-		defenseSignals[entity] = entry
-	end
-	return entry
-end
 
 local function timingKey(timing)
 	if timing and type(timing.id) == "function" then
@@ -1249,12 +1217,6 @@ local function timingKey(timing)
 		end
 	end
 	return tostring(timing and timing.name or "Unknown")
-end
-
-local function profileMinConfidence(profileName)
-	return NO_HITBOX_PROFILE_MIN_CONFIDENCE[profileName or ""]
-		or NO_HITBOX_PROFILE_MIN_CONFIDENCE[NO_HITBOX_PROFILE_DEFAULT]
-		or 2.0
 end
 
 local function nextBlockTagId()
@@ -1384,13 +1346,6 @@ end)
 ---@param action Action
 ---@return boolean
 Defender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
-	local integer = Random.new():NextNumber(1.0, 100.0)
-	local rate = Configuration.expectOptionValue("FailureRate") or 0.0
-
-	if Configuration.expectToggleValue("AllowFailure") and integer <= rate then
-		return self:notify(timing, "(%i <= %i) Intentionally did not run.", integer, rate)
-	end
-
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
 		if Configuration.expectToggleValue("EnableM1AutoTrade") then
 			return self:notify(timing, "Auto Defense disabled (M1 Trade only).")
@@ -1398,31 +1353,55 @@ Defender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 		return self:notify(timing, "Auto Defense disabled.")
 	end
 
-	local selectedFilters = Configuration.expectOptionValue("AutoDefenseFilters") or {}
-	local function filterEnabled(name, legacy)
-		return selectedFilters[name] or (legacy and selectedFilters[legacy])
-	end
-
 	local character = players.LocalPlayer.Character
 	if not character then
 		return self:notify(timing, "No character found.")
 	end
 
-	if character:GetAttribute("CurrentState") == "Attacking" or character:GetAttribute("CurrentState") == "Skill" then
+	local integer = Random.new():NextNumber(1.0, 100.0)
+	local rate = Configuration.expectOptionValue("FailureRate") or 0.0
+	if not NO_HITBOX_ONLY and Configuration.expectToggleValue("AllowFailure") and integer <= rate then
+		return self:notify(timing, "(%i <= %i) Intentionally did not run.", integer, rate)
+	end
+
+	local selectedFilters = Configuration.expectOptionValue("AutoDefenseFilters") or {}
+	local function filterEnabled(name, legacy)
+		return selectedFilters[name] or (legacy and selectedFilters[legacy])
+	end
+
+	local currentState = character:GetAttribute("CurrentState")
+	if filterEnabled("Disable When Knocked Recently") and AttributeListener.krecently and AttributeListener.krecently() then
+		return self:notify(timing, "User was knocked recently.")
+	end
+
+	if filterEnabled("Disable When In Dash") and currentState == "Dashing" then
+		return self:notify(timing, "User is dashing.")
+	end
+
+	if filterEnabled("Disable When In Flashstep") and currentState == "Flashstep" then
+		return self:notify(timing, "User is flashstepping.")
+	end
+
+	if currentState == "Attacking" or currentState == "Skill" then
 		return self:notify(timing, "Currently attacking.")
 	end
 
 	local chatInputBarConfiguration = textChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
-
 	if
-		selectedFilters["Disable When Textbox Focused"]
+		filterEnabled("Disable When Textbox Focused")
 		and (userInputService:GetFocusedTextBox() or (chatInputBarConfiguration and chatInputBarConfiguration.IsFocused))
 	then
 		return self:notify(timing, "User is typing in a text box.")
 	end
 
-	if selectedFilters["Disable When Window Not Active"] and iswindowactive and not iswindowactive() then
+	if filterEnabled("Disable When Window Not Active") and iswindowactive and not iswindowactive() then
 		return self:notify(timing, "Window is not active.")
+	end
+
+	if filterEnabled("Disable When Holding Block")
+		and userInputService:IsKeyDown((Keybinding.info and Keybinding.info["Block / Parry"]) or Enum.KeyCode.F)
+	then
+		return self:notify(timing, "User is holding block.")
 	end
 
 	if timing.tag == "M1" and filterEnabled("Filter Out M1s") then
@@ -1445,117 +1424,14 @@ Defender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 		return self:notify(timing, "Attacker is using an 'Other' attack.")
 	end
 
-	if NO_HITBOX_ONLY and (timing.tag == "Skill" or timing.tag == "Mantra") then
-		local minConfidence = Defender.requiredMinConfidence(timing.tag, timing.minConfidence)
-		local confidence = Defender.getSignalConfidence(self.entity or self.owner or self.part, timing.tag)
-		if confidence < minConfidence then
-			return self:notify(timing, "Signal confidence %.2f < %.2f.", confidence, minConfidence)
-		end
-	end
-
 	return true
 end)
 
-function Defender.recordSignal(entity, kind, name)
-	local entry = signalEntry(entity)
-	if not entry then
-		return
-	end
-	local now = os.clock()
-	local value = tostring(name or "")
-
-	if kind == "Effect" then
-		entry.lastEffectAt = now
-		entry.lastEffectName = value
-		return
-	end
-
-	if kind == "Skill" then
-		entry.lastSkillAt = now
-		entry.lastSkillName = value
-		return
-	end
-
-	if kind == "Part" then
-		entry.lastPartAt = now
-		entry.lastPartName = value
-		return
-	end
-
-	if kind == "Sound" then
-		entry.lastSoundAt = now
-		entry.lastSoundName = value
-		return
-	end
-
-	if kind == "Attribute" then
-		entry.lastAttrAt = now
-		entry.lastAttrName = value
-		return
-	end
-
-	entry.lastAnimAt = now
-	entry.lastAnimId = value
-end
-
-function Defender.requiredMinConfidence(tag, overrideValue)
-	local _ = tag
-	if type(overrideValue) == "number" and overrideValue > 0 then
-		return overrideValue
-	end
-	local profile = Configuration.expectOptionValue("DefenseProfile")
-	if type(profile) ~= "string" or profile == "" then
-		profile = NO_HITBOX_PROFILE_DEFAULT
-	end
-	local profileDefault = profileMinConfidence(profile)
-	local configured = Configuration.expectOptionValue("NoHitboxMinConfidence")
-	if type(configured) == "number" and configured > 0 then
-		return math.max(configured, profileDefault)
-	end
-	return profileDefault
-end
-
-function Defender.getSignalConfidence(entity, tag)
-	local _ = tag
-	local entry = signalEntry(entity)
-	if not entry then
-		return 0
-	end
-
-	local now = os.clock()
-	local confidence = 0
-	local sourceCount = 0
-
-	local function apply(weight, stamp, window)
-		if type(stamp) ~= "number" then
-			return
-		end
-		local age = now - stamp
-		if age < 0 or age > window then
-			return
-		end
-		local normalized = 1 - (age / window)
-		confidence += weight * math.clamp(normalized, 0, 1)
-		if age <= SIGNAL_WINDOW_MULTI then
-			sourceCount += 1
-		end
-	end
-
-	apply(3.0, entry.lastSkillAt, SIGNAL_WINDOW_SKILL)
-	apply(2.5, entry.lastEffectAt, SIGNAL_WINDOW_EFFECT)
-	apply(2.0, entry.lastAnimAt, SIGNAL_WINDOW_ANIMATION)
-	apply(1.8, entry.lastPartAt, SIGNAL_WINDOW_PART)
-	apply(1.5, entry.lastSoundAt, SIGNAL_WINDOW_SOUND)
-
-	if sourceCount >= 2 then
-		confidence += 1.0
-	end
-
-	return confidence
-end
-
 function Defender:cooldownAllow(timing)
 	local ms = Configuration.expectOptionValue("DefenseCooldownMs") or 0
+	if NO_HITBOX_ONLY and ms <= 0 then
+		ms = 45
+	end
 	if ms <= 0 then
 		return true
 	end
@@ -1854,20 +1730,12 @@ Defender.hc = LPH_NO_VIRTUALIZE(function(self, options, info)
 		return true
 	end
 
-	if Configuration.expectToggleValue("IgnoreHitboxChecks") then
-		return true
-	end
-
 	local root = character:FindFirstChild("HumanoidRootPart")
 	if not root then
 		return false
 	end
 
 	if action and action.ihbc then
-		return true
-	end
-
-	if timing and timing.tag == "M1" and Configuration.expectToggleValue("IgnoreM1HitboxChecks") then
 		return true
 	end
 
@@ -1980,14 +1848,14 @@ Defender.handle = LPH_NO_VIRTUALIZE(function(self, timing, action, notify)
 	end
 
 	local actionType = PP_SCRAMBLE_STR(action._type)
-	local reactionDelay = Configuration.expectOptionValue("ReactionDelaySeconds") or 0
+	local reactionDelay = NO_HITBOX_ONLY and 0 or (Configuration.expectOptionValue("ReactionDelaySeconds") or 0)
 	if reactionDelay > 0 and actionType ~= "Start Block" and actionType ~= "End Block" then
 		task.wait(reactionDelay)
 	end
 
 	-- Dash instead of parry.
-	local dashReplacement = Random.new():NextNumber(1.0, 100.0)
-		<= (Configuration.expectOptionValue("DashInsteadOfParryRate") or 0.0)
+	local dashReplacement = (not NO_HITBOX_ONLY)
+		and (Random.new():NextNumber(1.0, 100.0) <= (Configuration.expectOptionValue("DashInsteadOfParryRate") or 0.0))
 
 	if actionType ~= "Parry" then
 		dashReplacement = false
@@ -2348,8 +2216,6 @@ SoundDefender.process = LPH_NO_VIRTUALIZE(function(self)
 		return
 	end
 
-	Defender.recordSignal(self.owner or self.part, "Sound", tostring(self.sound.SoundId))
-
 	local distance = self:distance(self.owner or self.part)
 	if type(handleAutoCounterTiming) == "function" then
 		handleAutoCounterTiming(timing, "Sound", distance)
@@ -2415,15 +2281,6 @@ local RepeatInfo = require("Features/Combat/Objects/RepeatInfo")
 
 ---@module Features.Combat.Objects.HitboxOptions
 local HitboxOptions = require("Features/Combat/Objects/HitboxOptions")
-
----@module Utility.Configuration
-local Configuration = require("Utility/Configuration")
-
----@module Game.Timings.PartTiming
-local PartTiming = require("Game/Timings/PartTiming")
-
----@module Game.Timings.Action
-local Action = require("Game/Timings/Action")
 
 ---@class PartDefender: Defender
 ---@field part BasePart
@@ -2710,7 +2567,6 @@ PartDefender.valid = LPH_NO_VIRTUALIZE(function(self, timing, action)
 	end
 
 	if not self.timing.duih then
-		Defender.recordSignal(self.entity or self.part, "Part", timing and timing.name or "Part")
 		if not self:hc(options, timing.duih and RepeatInfo.new(timing) or nil) then
 			return self:notify(timing, "Not in hitbox.")
 		end
@@ -2755,7 +2611,6 @@ PartDefender.update = LPH_NO_VIRTUALIZE(function(self)
 		self.hmid = self.hmaid:uid()
 	end
 	options.hmid = self.hmid
-	Defender.recordSignal(self.entity or self.part, "Part", self.timing and self.timing.name or "Part")
 	local touching = self:hc(options, nil)
 
 	if not touching then
@@ -2790,54 +2645,8 @@ function PartDefender.new(part, timing)
 	self.entity = part:FindFirstAncestorWhichIsA("Model")
 	local selected = timing or resolveTiming(part)
 	if not selected then
-		if Configuration.expectToggleValue("EnableDynamicPartSignals") then
-			if type(PartTiming) ~= "table" or type(PartTiming.new) ~= "function" or type(Action) ~= "table" or type(Action.new) ~= "function" then
-				self:initial(part, SaveManager.ps, nil, part.Name)
-				return nil
-			end
-			local distance = self:distance(part)
-			if not distance then
-				return nil
-			end
-			local maxDist = Configuration.expectOptionValue("DynamicPartMaxDistance") or 20
-			if distance > maxDist then
-				return nil
-			end
-			local dynamic = PartTiming.new()
-			dynamic.name = part.Name
-			dynamic.tag = "Part"
-			dynamic.imdd = 0
-			dynamic.imxd = maxDist
-			dynamic.hitbox = part.Size
-			local isBall = part:IsA("Part") and part.Shape == Enum.PartType.Ball
-			dynamic.shape = isBall and "Ball" or "Box"
-			dynamic.offset = Vector3.zero
-			dynamic.punishable = 0
-			dynamic.after = 0
-			dynamic.duih = true
-			dynamic.fhb = true
-			dynamic.umoa = false
-
-			if not dynamic.actions or type(dynamic.actions.push) ~= "function" then
-				self:initial(part, SaveManager.ps, nil, part.Name)
-				return nil
-			end
-
-			local action = Action.new()
-			action._type = "Parry"
-			action._when = 0
-			action.name = "DynamicParry"
-			action.hitbox = dynamic.hitbox
-			action.shape = dynamic.shape
-			action.offset = dynamic.offset
-			action.ihbc = false
-			dynamic.actions:push(action)
-
-			selected = dynamic
-		else
-			self:initial(part, SaveManager.ps, nil, part.Name)
-			return nil
-		end
+		self:initial(part, SaveManager.ps, nil, part.Name)
+		return nil
 	end
 
 	local distance = self:distance(part)
@@ -4555,7 +4364,6 @@ local Configuration = require("Utility/Configuration")
 local Library = require("GUI/Library")
 local AttributeListener = require("Features/Combat/AttributeListener")
 local Defender = require("Features/Combat/Objects/Defender")
-local HitboxOptions = require("Features/Combat/Objects/HitboxOptions")
 local Logger = require("Utility/Logger")
 
 local LocalPlayer = Players.LocalPlayer
@@ -4569,8 +4377,8 @@ local hitboxDefender = Defender.new()
 local clock = os.clock
 local pollActive = false
 local pollTask = nil
-local pollInterval = 0.03
-local NO_HITBOX_COOLDOWN = 0.035
+local pollInterval = NO_HITBOX_SKILL_POLL_SECONDS
+local NO_HITBOX_COOLDOWN = 0.03
 local MAX_NO_HITBOX_DELAY = 0.06
 local skillContext = {}
 local SKILL_LOCK_BASE = 0.08
@@ -4578,67 +4386,16 @@ local runSkillAction
 local skillDelaySeconds
 local fireNoHitbox
 
-local function profileMinConfidence()
-	local profile = Configuration.expectOptionValue("DefenseProfile")
-	if type(profile) ~= "string" or profile == "" then
-		profile = NO_HITBOX_PROFILE_DEFAULT
-	end
-	return NO_HITBOX_PROFILE_MIN_CONFIDENCE[profile]
-		or NO_HITBOX_PROFILE_MIN_CONFIDENCE[NO_HITBOX_PROFILE_DEFAULT]
-		or 2.0
-end
-
-local function noHitboxMinConfidence(rule)
-	if rule and type(rule.minConfidence) == "number" and rule.minConfidence > 0 then
-		return rule.minConfidence
-	end
-	local profileDefault = profileMinConfidence()
-	local configured = Configuration.expectOptionValue("NoHitboxMinConfidence")
-	if type(configured) == "number" and configured > 0 then
-		return math.max(configured, profileDefault)
-	end
-	return profileDefault
-end
-
 local function noHitboxReactionBiasSeconds()
-	local ms = Configuration.expectOptionValue("NoHitboxReactionBiasMs")
-	if type(ms) ~= "number" then
-		ms = -35
-	end
-	return ms / 1000
+	return NO_HITBOX_REACTION_BIAS_SECONDS
 end
 
 local function noHitboxSkillPollSeconds()
-	local ms = Configuration.expectOptionValue("NoHitboxSkillPollMs")
-	if type(ms) ~= "number" then
-		ms = pollInterval * 1000
-	end
-	return math.max(0.01, ms / 1000)
-end
-
-local function applyWorldOffset(cframe, offset)
-	if not offset or offset == Vector3.zero then
-		return cframe
-	end
-
-	local rotation = cframe - cframe.Position
-	local applied = (cframe.RightVector * offset.X)
-		+ (cframe.UpVector * offset.Y)
-		+ (cframe.LookVector * offset.Z)
-	return CFrame.new(cframe.Position + applied) * rotation
+	return NO_HITBOX_SKILL_POLL_SECONDS
 end
 
 local function normalizeShape(shape)
 	return shape == "Ball" and "Ball" or "Box"
-end
-
-local function getEnemyRoot(def)
-	local character = def and def.character
-	if not character then
-		return nil
-	end
-
-	return character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso")
 end
 
 local function passesDistance(def, rule)
@@ -4657,86 +4414,16 @@ local function passesDistance(def, rule)
 	return distance >= minDistance and distance <= maxDistance
 end
 
-local function predictionSeconds()
-	return 0.15 + Defender.rdelay()
-end
-
 local function passesHitbox(def, rule)
-	if NO_HITBOX_ONLY then
-		return true
-	end
-	if rule and rule.ihbc then
-		return true
-	end
-
-	local hitbox = rule.hitbox
-	if typeof(hitbox) ~= "Vector3" then
-		return true
-	end
-
-	local root = getEnemyRoot(def)
-	local localCharacter = LocalPlayer and LocalPlayer.Character
-	if not root or not localCharacter then
-		return false
-	end
-
-	local timing = {
-		shape = rule.shape,
-		hitbox = rule.hitbox,
-		offset = rule.offset or Vector3.zero,
-		fhb = rule.fhb ~= false,
-		duih = false,
-	}
-
-	local options = HitboxOptions.new(root, timing, { localCharacter })
-	if not rule._visId then
-		rule._visId = hitboxDefender.hmaid:uid()
-	end
-	options.hmid = rule._visId
-	options.spredict = true
-	options.ptime = predictionSeconds()
-	options.entity = def.character or root.Parent
-
-	local action = rule and rule.ihbc and { ihbc = true } or nil
-	options.action = action
-	return hitboxDefender:hc(options, nil)
+	local _ = def
+	local _rule = rule
+	return true
 end
 
 local function passesHitboxRaw(def, rule)
-	if NO_HITBOX_ONLY then
-		return true
-	end
-	local hitbox = rule.hitbox
-	if typeof(hitbox) ~= "Vector3" then
-		return true
-	end
-
-	local root = getEnemyRoot(def)
-	local localCharacter = LocalPlayer and LocalPlayer.Character
-	if not root or not localCharacter then
-		return false
-	end
-
-	local timing = {
-		shape = rule.shape,
-		hitbox = rule.hitbox,
-		offset = rule.offset or Vector3.zero,
-		fhb = rule.fhb ~= false,
-		duih = false,
-	}
-
-	local options = HitboxOptions.new(root, timing, { localCharacter })
-	if not rule._visId then
-		rule._visId = hitboxDefender.hmaid:uid()
-	end
-	options.hmid = rule._visId
-	options.spredict = true
-	options.ptime = predictionSeconds()
-	options.entity = def.character or root.Parent
-
-	local action = rule and rule.ihbc and { ihbc = true } or nil
-	options.action = action
-	return hitboxDefender:hc(options, nil)
+	local _ = def
+	local _rule = rule
+	return true
 end
 
 local function blockAcquire()
@@ -4756,11 +4443,6 @@ local function jumpNow()
 end
 
 local function allowActions(tag)
-	local selectedFilters = Configuration.expectOptionValue("AutoDefenseFilters") or {}
-	local function filterEnabled(name, legacy)
-		return selectedFilters[name] or (legacy and selectedFilters[legacy])
-	end
-
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
 		return false
 	end
@@ -4770,18 +4452,42 @@ local function allowActions(tag)
 		return false
 	end
 
-	if character:GetAttribute("CurrentState") == "Attacking" or character:GetAttribute("CurrentState") == "Skill" then
+	local selectedFilters = Configuration.expectOptionValue("AutoDefenseFilters") or {}
+	local function filterEnabled(name, legacy)
+		return selectedFilters[name] or (legacy and selectedFilters[legacy])
+	end
+
+	local currentState = character:GetAttribute("CurrentState")
+	if filterEnabled("Disable When Knocked Recently") and AttributeListener.krecently and AttributeListener.krecently() then
+		return false
+	end
+
+	if filterEnabled("Disable When In Dash") and currentState == "Dashing" then
+		return false
+	end
+
+	if filterEnabled("Disable When In Flashstep") and currentState == "Flashstep" then
+		return false
+	end
+
+	if currentState == "Attacking" or currentState == "Skill" then
 		return false
 	end
 
 	local chatInputBarConfiguration = textChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
-	if selectedFilters["Disable When Textbox Focused"]
+	if filterEnabled("Disable When Textbox Focused")
 		and (userInputService:GetFocusedTextBox() or (chatInputBarConfiguration and chatInputBarConfiguration.IsFocused))
 	then
 		return false
 	end
 
-	if selectedFilters["Disable When Window Not Active"] and iswindowactive and not iswindowactive() then
+	if filterEnabled("Disable When Window Not Active") and iswindowactive and not iswindowactive() then
+		return false
+	end
+
+	if filterEnabled("Disable When Holding Block")
+		and userInputService:IsKeyDown(Enum.KeyCode.F)
+	then
 		return false
 	end
 
@@ -4800,6 +4506,33 @@ local function normalizeSkillValue(raw)
 	return lowerValue, lowerValue
 end
 
+local function canonicalSkillValue(raw)
+	return tostring(raw or ""):gsub("[^%w]", "")
+end
+
+local function isWordBoundaryChar(ch)
+	return ch == nil or ch == "" or not string.match(ch, "[%w]")
+end
+
+local function boundedContains(haystack, needle)
+	if type(haystack) ~= "string" or type(needle) ~= "string" or needle == "" then
+		return false
+	end
+	local from = 1
+	while true do
+		local s, e = haystack:find(needle, from, true)
+		if not s then
+			return false
+		end
+		local prev = (s > 1) and haystack:sub(s - 1, s - 1) or nil
+		local nextc = (e < #haystack) and haystack:sub(e + 1, e + 1) or nil
+		if isWordBoundaryChar(prev) and isWordBoundaryChar(nextc) then
+			return true
+		end
+		from = s + 1
+	end
+end
+
 local function getSkillLogIdentity(def)
 	local plr = def.player
 	if not plr and def.character then
@@ -4807,21 +4540,6 @@ local function getSkillLogIdentity(def)
 	end
 	local name = (plr and plr.Name) or (def.character and def.character.Name) or "Unknown"
 	return name, plr == LocalPlayer
-end
-
-local function recordSkillSignal(def, value)
-	if type(value) ~= "string" or value == "" then
-		def.lastSignalValue = nil
-		return
-	end
-	if def.lastSignalValue == value then
-		return
-	end
-	def.lastSignalValue = value
-	if Defender and Defender.recordSignal then
-		local entity = def.character or (def.player and def.player.Character)
-		Defender.recordSignal(entity, "Skill", value)
-	end
 end
 
 local function updateSkillEntryLabel(entry, tag, who, state, value, seconds, secondsLabel)
@@ -4842,10 +4560,30 @@ local function updateSkillEntryLabel(entry, tag, who, state, value, seconds, sec
 end
 
 local function matchSkill(lowerValue, compactValue, token, spacedToken)
-	if spacedToken and lowerValue:find(spacedToken, 1, true) then
+	local tokenLower = lower(tostring(token or ""))
+	if tokenLower == "" then
+		return false
+	end
+	local spacedLower = spacedToken and lower(tostring(spacedToken)) or nil
+	if spacedLower and (lowerValue == spacedLower or boundedContains(lowerValue, spacedLower)) then
 		return true
 	end
-	return compactValue:find(token, 1, true) ~= nil
+	if lowerValue == tokenLower or boundedContains(lowerValue, tokenLower) then
+		return true
+	end
+	local canonicalValue = canonicalSkillValue(lowerValue)
+	local canonicalCompact = canonicalSkillValue(compactValue)
+	local canonicalToken = canonicalSkillValue(tokenLower)
+	if canonicalToken ~= "" and (canonicalValue == canonicalToken or canonicalCompact == canonicalToken) then
+		return true
+	end
+	if spacedLower then
+		local canonicalSpaced = canonicalSkillValue(spacedLower)
+		if canonicalSpaced ~= "" and (canonicalValue == canonicalSpaced or canonicalCompact == canonicalSpaced) then
+			return true
+		end
+	end
+	return false
 end
 
 local function jumpTwice()
@@ -4858,7 +4596,7 @@ end
 local function blockFor(seconds)
 	local hold = seconds or 0
 	if hold <= 0 and NO_HITBOX_ONLY then
-		hold = Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+		hold = NO_HITBOX_MIN_BLOCK_SECONDS
 	end
 	if hold > 0 then
 		InputClient.blockHoldSeconds(hold)
@@ -5379,7 +5117,6 @@ function UsingSkillWatcher.update(def)
 	end
 	local value = skill.Value
 	if type(value) ~= "string" then
-		def.lastSignalValue = nil
 		if def and def.states then
 			for key, active in pairs(def.states) do
 				if active then
@@ -5393,7 +5130,6 @@ function UsingSkillWatcher.update(def)
 		end
 		return
 	end
-	recordSkillSignal(def, value)
 	local lowerValue, compactValue = normalizeSkillValue(value)
 	def.lastValue = lowerValue
 
@@ -5417,43 +5153,80 @@ function UsingSkillWatcher.update(def)
 		end
 		local isDeferred = rule.deferHitboxSeconds and rule.deferHitboxSeconds > 0
 		local distanceMatched = tokenMatched and passesDistance(def, rule)
-		local ruleMatched = distanceMatched and (NO_HITBOX_ONLY or passesHitbox(def, rule))
 		local wasActive = def.states[key] == true
-		local hitboxWasActive = info.hitboxActive == true
-
-		if tokenMatched and not wasActive then
-			def.states[key] = true
-			info.hitboxActive = false
-			if handleAutoCounterTiming then
-				handleAutoCounterTiming({ tag = "Skill" }, "SkillWatcher", hitboxDefender:distance(def.character))
-			end
-			if isDeferred and type(rule.onStart) == "function" then
-				executeRuleOnStart(def, key, rule, lowerValue, compactValue)
-			end
-		elseif not tokenMatched and wasActive then
-			def.states[key] = false
-			info.hitboxActive = false
-			if info.trackToken then
-				info.trackToken = info.trackToken + 1
-			end
-			if type(rule.onStop) == "function" then
-				rule.onStop(def, lowerValue, compactValue)
-			end
-		end
-
-		if tokenMatched and not isDeferred then
-			if ruleMatched and not hitboxWasActive then
-				info.hitboxActive = true
-				executeRuleOnStart(def, key, rule, lowerValue, compactValue)
-			elseif ruleMatched and hitboxWasActive then
-				if type(rule.onTick) == "function" then
-					rule.onTick(def, lowerValue, compactValue)
+		if NO_HITBOX_ONLY then
+			if distanceMatched then
+				if not wasActive then
+					def.states[key] = true
+					info.hitboxActive = true
+					info.guardPulseAt = now
+					if handleAutoCounterTiming then
+						handleAutoCounterTiming({ tag = "Skill" }, "SkillWatcher", hitboxDefender:distance(def.character))
+					end
+					blockFor((rule and rule.minBlockSeconds) or NO_HITBOX_MIN_BLOCK_SECONDS)
+					if type(rule.onStart) == "function" then
+						executeRuleOnStart(def, key, rule, lowerValue, compactValue)
+					end
+				else
+					if type(rule.onTick) == "function" then
+						rule.onTick(def, lowerValue, compactValue)
+					else
+						local pulseAt = info.guardPulseAt or 0
+						if now - pulseAt >= NO_HITBOX_ACTIVE_GUARD_PULSE_SECONDS then
+							info.guardPulseAt = now
+							blockFor((rule and rule.minBlockSeconds) or NO_HITBOX_MIN_BLOCK_SECONDS)
+						end
+					end
 				end
-			elseif not ruleMatched and hitboxWasActive then
+			elseif wasActive then
+				def.states[key] = false
 				info.hitboxActive = false
+				if info.trackToken then
+					info.trackToken = info.trackToken + 1
+				end
+				if type(rule.onStop) == "function" then
+					rule.onStop(def, lowerValue, compactValue)
+				end
+			end
+		else
+			local ruleMatched = distanceMatched and passesHitbox(def, rule)
+			local hitboxWasActive = info.hitboxActive == true
+
+			if tokenMatched and not wasActive then
+				def.states[key] = true
+				info.hitboxActive = false
+				if handleAutoCounterTiming then
+					handleAutoCounterTiming({ tag = "Skill" }, "SkillWatcher", hitboxDefender:distance(def.character))
+				end
+				if isDeferred and type(rule.onStart) == "function" then
+					executeRuleOnStart(def, key, rule, lowerValue, compactValue)
+				end
+			elseif not tokenMatched and wasActive then
+				def.states[key] = false
+				info.hitboxActive = false
+				if info.trackToken then
+					info.trackToken = info.trackToken + 1
+				end
+				if type(rule.onStop) == "function" then
+					rule.onStop(def, lowerValue, compactValue)
+				end
+			end
+
+			if tokenMatched and not isDeferred then
+				if ruleMatched and not hitboxWasActive then
+					info.hitboxActive = true
+					executeRuleOnStart(def, key, rule, lowerValue, compactValue)
+				elseif ruleMatched and hitboxWasActive then
+					if type(rule.onTick) == "function" then
+						rule.onTick(def, lowerValue, compactValue)
+					end
+				elseif not ruleMatched and hitboxWasActive then
+					info.hitboxActive = false
+				end
 			end
 		end
 	end
+
 end
 
 function UsingSkillWatcher.queueUpdate(def)
@@ -5609,6 +5382,9 @@ function UsingSkillWatcher.init()
 end
 
 skillDelaySeconds = function()
+	if NO_HITBOX_ONLY then
+		return 0
+	end
 	local biased = Defender.rdelay() + noHitboxReactionBiasSeconds()
 	return math.clamp(math.max(0, biased), 0, MAX_NO_HITBOX_DELAY)
 end
@@ -5625,27 +5401,8 @@ local function getSkillContext(def)
 	return ctx
 end
 
-local function defaultPriority(rule)
-	if rule and rule.priority then
-		return rule.priority
-	end
-	return 2
-end
-
-local function defaultCooldownMs(rule)
-	if rule and rule.cooldownMs then
-		return rule.cooldownMs
-	end
-	local prio = defaultPriority(rule)
-	if prio <= 1 then
-		return 40
-	elseif prio == 2 then
-		return 70
-	end
-	return 110
-end
-
 runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
+	local _ = compactValue
 	if not Configuration.expectToggleValue("EnableAutoDefense") then
 		return
 	end
@@ -5654,26 +5411,72 @@ runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
 		return
 	end
 	local now = clock()
-	local prio = defaultPriority(rule)
-	if ctx.lockUntil and now < ctx.lockUntil and prio < (ctx.lockPriority or 0) then
+	local distance = hitboxDefender:distance(def.character) or math.huge
+	local value = tostring(lowerValue or "")
+	local threat = (rule and tonumber(rule.priority)) or 1
+
+	if distance <= 16 then
+		threat = threat + 2.6
+	elseif distance <= 30 then
+		threat = threat + 1.8
+	elseif distance <= 50 then
+		threat = threat + 1.1
+	elseif distance <= 75 then
+		threat = threat + 0.6
+	else
+		threat = threat + 0.2
+	end
+
+	if value:find("grab", 1, true) or value:find("rush", 1, true) or value:find("combo", 1, true) then
+		threat = threat + 1.4
+	elseif value:find("barrage", 1, true) or value:find("gatling", 1, true) or value:find("onslaught", 1, true) then
+		threat = threat + 1.1
+	elseif value:find("meteor", 1, true) or value:find("final", 1, true) or value:find("ult", 1, true) then
+		threat = threat + 1.2
+	end
+
+	local prio = 1
+	local cdMs = 75
+	local lockSeconds = (rule and rule.lockSeconds) or SKILL_LOCK_BASE
+	if threat >= 4.8 then
+		prio = 3
+		cdMs = 35
+		lockSeconds = math.max(lockSeconds, 0.10)
+	elseif threat >= 3.2 then
+		prio = 2
+		cdMs = 52
+		lockSeconds = math.max(lockSeconds, 0.08)
+	else
+		prio = 1
+		cdMs = 75
+		lockSeconds = math.max(lockSeconds, 0.06)
+	end
+
+	if rule and type(rule.priority) == "number" then
+		prio = math.max(prio, rule.priority)
+	end
+	if rule and type(rule.cooldownMs) == "number" then
+		cdMs = math.max(0, rule.cooldownMs)
+	end
+
+	if not NO_HITBOX_ONLY and ctx.lockUntil and now < ctx.lockUntil and prio < (ctx.lockPriority or 0) then
 		return
 	end
-	if NO_HITBOX_ONLY then
-		local confidence = Defender.getSignalConfidence and Defender.getSignalConfidence(def.character, "Skill") or 0
-		local minConfidence = noHitboxMinConfidence(rule)
-		if confidence < minConfidence then
-			return
-		end
-	end
-	local cdMs = defaultCooldownMs(rule)
+
 	local last = ctx.lastSkillAt[key]
 	if last and now - last < (cdMs / 1000) then
 		return
 	end
+
 	ctx.lastSkillAt[key] = now
 	ctx.lockPriority = prio
-	ctx.lockUntil = now + (rule.lockSeconds or SKILL_LOCK_BASE)
-	local delay = rule.adaptiveDelay == false and 0 or skillDelaySeconds()
+	ctx.lockUntil = now + (NO_HITBOX_ONLY and 0.03 or lockSeconds)
+
+	local delay = 0
+	if not NO_HITBOX_ONLY then
+		delay = rule.adaptiveDelay == false and 0 or skillDelaySeconds()
+	end
+
 	if delay > 0 then
 		task.delay(delay, function()
 			if not Configuration.expectToggleValue("EnableAutoDefense") then
@@ -5690,11 +5493,6 @@ runSkillAction = function(def, key, rule, lowerValue, compactValue, actionFn)
 		actionFn()
 		activeSkillDef = prev
 	end
-end
-
-local function noHitboxDelaySeconds()
-	local biased = Defender.rdelay() + noHitboxReactionBiasSeconds()
-	return math.clamp(math.max(0, biased), 0, MAX_NO_HITBOX_DELAY)
 end
 
 fireNoHitbox = function(def, key, rule, lowerValue, compactValue)
@@ -6765,10 +6563,41 @@ end
 local function getLocalRoot()
 	local character = Players.LocalPlayer and Players.LocalPlayer.Character
 	if not character then
-		return nil, nil
+		return nil, nil, nil
 	end
 	local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso")
-	return character, root
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	return character, root, humanoid
+end
+
+local function moveHumanoid(humanoid, direction)
+	if not humanoid or not humanoid.Parent then
+		return false
+	end
+	local moveDirection = direction
+	if typeof(moveDirection) ~= "Vector3" then
+		moveDirection = Vector3.zero
+	end
+	if moveDirection.Magnitude > 1 then
+		moveDirection = moveDirection.Unit
+	end
+	local ok = pcall(function()
+		humanoid:Move(moveDirection, false)
+	end)
+	return ok
+end
+
+local function moveHumanoidTo(humanoid, position)
+	if not humanoid or not humanoid.Parent then
+		return false
+	end
+	if typeof(position) ~= "Vector3" then
+		return false
+	end
+	local ok = pcall(function()
+		humanoid:MoveTo(position)
+	end)
+	return ok
 end
 
 local waitWithCancel = LPH_NO_VIRTUALIZE(function(seconds, token)
@@ -6946,7 +6775,7 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	if not target or not target.root then
 		return
 	end
-	local _, localRoot = getLocalRoot()
+	local character, localRoot, humanoid = getLocalRoot()
 	if not localRoot then
 		return
 	end
@@ -6985,11 +6814,14 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 		if not step.relativeOffset then
 			return vec
 		end
+		local fallbackBasis = (localRoot and localRoot.CFrame)
+			or (target and target.root and target.root.CFrame)
+			or CFrame.new()
 		local basis = nil
 		if step.relativeToLocal then
-			basis = localRoot and localRoot.CFrame or headInstance.CFrame
+			basis = (localRoot and localRoot.CFrame) or fallbackBasis
 		else
-			basis = (target and target.root and target.root.CFrame) or headInstance.CFrame
+			basis = (target and target.root and target.root.CFrame) or fallbackBasis
 		end
 		local forward = Vector3.new(basis.LookVector.X, 0, basis.LookVector.Z)
 		if forward.Magnitude > 1e-3 then
@@ -7019,13 +6851,17 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	end
 
 	local start = os.clock()
-	local character = Players.LocalPlayer and Players.LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local walkForce = 0.05
 	while os.clock() - start < totalTime do
 		if not isRunning(token) then
 			return
 		end
+		local liveCharacter, liveRoot, liveHumanoid = getLocalRoot()
+		if not liveCharacter or not liveRoot then
+			return
+		end
+		character = liveCharacter
+		localRoot = liveRoot
+		humanoid = liveHumanoid or humanoid
 		if not isTargetValid(target) then
 			if Configuration.expectToggleValue("AutoComboRetargetOnInvalid") and state then
 				target = resolveTarget(state)
@@ -7046,7 +6882,7 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 		local toDest = dest - current
 		local distance = toDest.Magnitude
 		if humanoid then
-			humanoid:Move(localRoot.CFrame.LookVector * walkForce, false)
+			moveHumanoid(humanoid, localRoot.CFrame.LookVector)
 		end
 		if distance > 0.001 then
 			local dt = RunService.RenderStepped:Wait()
@@ -7062,18 +6898,15 @@ local doTween = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 		end
 	end
 	if humanoid then
-		pcall(function()
-			humanoid:Move(Vector3.zero, false)
-		end)
+		moveHumanoid(humanoid, Vector3.zero)
 	end
 end)
 
 local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
-	local character, localRoot = getLocalRoot()
+	local character, localRoot, humanoid = getLocalRoot()
 	if not character or not localRoot then
 		return
 	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid then
 		return
 	end
@@ -7081,12 +6914,22 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	local stopDistance = math.max(0, safeNumber(step.stopDistance, optionValue("AutoComboMoveToStopDistance", 4)))
 	local useSprint = step.useSprint == true
 	local sprintHold = math.max(0, safeNumber(optionValue("AutoComboSprintHoldMs", 350), 350)) / 1000
+	local repathSeconds = math.max(0.03, safeNumber(step.repathSeconds, 0.06))
 
 	if duration <= 0 then
 		return
 	end
 
 	local movementLocked = false
+	local function stopMoveTo()
+		local _, liveRoot, liveHumanoid = getLocalRoot()
+		if liveHumanoid and liveRoot then
+			moveHumanoidTo(liveHumanoid, liveRoot.Position)
+		elseif humanoid and localRoot then
+			moveHumanoidTo(humanoid, localRoot.Position)
+		end
+	end
+
 	local function lockMovement()
 		if movementLocked then
 			return
@@ -7107,11 +6950,23 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 	local start = os.clock()
 	local lastSprint = 0
 	local lastPos = target and target.root and target.root.Position or nil
+	local nextMoveToAt = 0
+	local lastMoveToPos = nil
 	while os.clock() - start <= duration do
 		if not isRunning(token) then
+			stopMoveTo()
 			unlockMovement()
 			return
 		end
+		local liveCharacter, liveRoot, liveHumanoid = getLocalRoot()
+		if not liveCharacter or not liveRoot or not liveHumanoid then
+			stopMoveTo()
+			unlockMovement()
+			return
+		end
+		character = liveCharacter
+		localRoot = liveRoot
+		humanoid = liveHumanoid
 		if target and isTargetValid(target) then
 			state.lastTarget = target
 			lastPos = target.root.Position
@@ -7124,6 +6979,7 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 				if Configuration.expectToggleValue("AutoComboLockTarget") and state.lockedTarget then
 					AutoCombo.stop()
 				end
+				stopMoveTo()
 				unlockMovement()
 				return
 			end
@@ -7136,9 +6992,15 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 				break
 			end
 			if dist > 1e-3 then
-				humanoid:Move(flat.Unit, false)
-			else
-				humanoid:Move(Vector3.zero, false)
+				local now = os.clock()
+				local shouldUpdate = (not lastMoveToPos)
+					or ((lastMoveToPos - lastPos).Magnitude > 1)
+					or (now >= nextMoveToAt)
+				if shouldUpdate then
+					moveHumanoidTo(humanoid, lastPos)
+					lastMoveToPos = lastPos
+					nextMoveToAt = now + repathSeconds
+				end
 			end
 		end
 		if useSprint and sprintHold > 0 then
@@ -7148,11 +7010,9 @@ local doMoveTo = LPH_NO_VIRTUALIZE(function(step, target, token, state)
 				lastSprint = now
 			end
 		end
-		task.wait(0.05)
+		RunService.Heartbeat:Wait()
 	end
-	pcall(function()
-		humanoid:Move(Vector3.zero, false)
-	end)
+	stopMoveTo()
 	unlockMovement()
 end)
 
@@ -25422,6 +25282,7 @@ Library.ToggleKeybind = { Type = "KeyPicker", Value = "M" }
 Library.OwnerTag = "Cottom"
 Library.OwnerKeys = { toggles = {}, options = {} }
 
+do
 local loggerTab = window:AddTab("Logger")
 local loggerWindowGroup = loggerTab:AddLeftGroupbox("Logger Window")
 local showLoggerToggle = loggerWindowGroup:AddToggle("ShowLoggerWindow", {
@@ -26040,138 +25901,10 @@ autoDefenseDepBox:AddToggle("EnableVisualizations", {
 	Text = "Enable Visualizations",
 	Default = false,
 })
-local ignoreHitboxToggle = autoDefenseDepBox:AddToggle("IgnoreHitboxChecks", {
-	Text = "Ignore Hitbox Checks",
-	Default = true,
-	Tooltip = "Skips hitbox checks; timing distance limits still apply.",
-})
-local ignoreM1HitboxToggle = autoDefenseDepBox:AddToggle("IgnoreM1HitboxChecks", {
-	Text = "Ignore M1 Hitbox Checks",
-	Default = true,
-	Tooltip = "Skips hitbox checks for M1 timings only.",
-})
 autoDefenseDepBox:AddToggle("UseControllerM1", {
 	Text = "Use Controller M1 (VIM)",
 	Default = false,
 	Tooltip = "Send controller M1 (ButtonR2) instead of mouse clicks.",
-})
-autoDefenseDepBox:AddSlider("HitboxSampleCount", {
-	Text = "Hitbox Sample Count",
-	Min = 1,
-	Max = 5,
-	Default = 3,
-	Rounding = 0,
-})
-autoDefenseDepBox:AddSlider("HitboxSampleWindowMs", {
-	Text = "Hitbox Sample Window",
-	Min = 0,
-	Max = 200,
-	Default = 90,
-	Suffix = "ms",
-	Rounding = 0,
-})
-autoDefenseDepBox:AddToggle("UseEffectSignals", {
-	Text = "Use Effect Signals",
-	Default = true,
-})
-local effectSignalMode = autoDefenseDepBox:AddDropdown("EffectSignalMode", {
-	Text = "Effect Signal Mode",
-	Values = { "TargetOnly", "Whitelist", "AllExceptBlacklist" },
-	Default = "TargetOnly",
-})
-autoDefenseDepBox:AddSlider("EffectSignalWindowMs", {
-	Text = "Effect Signal Window",
-	Min = 0,
-	Max = 1000,
-	Default = 350,
-	Suffix = "ms",
-	Rounding = 0,
-})
-autoDefenseDepBox:AddInput("EffectSignalWhitelist", {
-	Text = "Effect Whitelist",
-	Placeholder = "Comma-separated effect names.",
-})
-autoDefenseDepBox:AddInput("EffectSignalBlacklist", {
-	Text = "Effect Blacklist",
-	Placeholder = "Comma-separated effect names.",
-})
-autoDefenseDepBox:AddToggle("EnableDynamicPartSignals", {
-	Text = "Enable Dynamic Part Signals",
-	Default = true,
-})
-autoDefenseDepBox:AddSlider("DynamicPartMaxDistance", {
-	Text = "Dynamic Part Max Distance",
-	Min = 0,
-	Max = 50,
-	Default = 20,
-	Suffix = "studs",
-	Rounding = 1,
-})
-autoDefenseDepBox:AddSlider("DefenseCooldownMs", {
-	Text = "Defense Cooldown",
-	Min = 0,
-	Max = 500,
-	Default = 120,
-	Suffix = "ms",
-	Rounding = 0,
-})
-
-local allowFailureToggle = autoDefenseDepBox:AddToggle("AllowFailure", {
-	Text = "Allow Failure",
-	Default = false,
-	Tooltip = "Occasionally fail parries to simulate human error.",
-})
-
-local allowFailureDepBox = autoDefenseDepBox:AddDependencyBox()
-allowFailureDepBox:AddSlider("FailureRate", {
-	Text = "Failure Rate",
-	Min = 0,
-	Max = 100,
-	Default = 0,
-	Suffix = "%",
-	Rounding = 2,
-})
-allowFailureDepBox:AddSlider("DashInsteadOfParryRate", {
-	Text = "Dash Instead Of Parry Rate",
-	Min = 0,
-	Max = 100,
-	Default = 0,
-	Suffix = "%",
-	Rounding = 2,
-})
-allowFailureDepBox:AddSlider("FakeMistimeRate", {
-	Text = "Fake Parry Mistime Rate",
-	Min = 0,
-	Max = 100,
-	Default = 0,
-	Suffix = "%",
-	Rounding = 2,
-})
-allowFailureDepBox:AddSlider("IgnoreAnimationEndRate", {
-	Text = "Ignore Animation End Rate",
-	Min = 0,
-	Max = 100,
-	Default = 0,
-	Suffix = "%",
-	Rounding = 2,
-})
-allowFailureDepBox:SetupDependencies({
-	{ allowFailureToggle, true },
-})
-
-autoDefenseDepBox:AddDropdown("AutoDefenseFilters", {
-	Text = "Auto Defense Filters",
-	Values = {
-		"Filter Out M1s",
-		"Filter Out Skills",
-		"Filter Out Counters",
-		"Filter Out Others",
-		"Disable When Textbox Focused",
-		"Disable When Window Not Active",
-	},
-	Multi = true,
-	AllowNull = true,
-	Default = {},
 })
 autoDefenseDepBox:AddDropdown("DefaultDashDirection", {
 	Text = "Default Dash Direction",
@@ -26187,88 +25920,9 @@ autoDefenseDepBox:AddSlider("BlockHoldSeconds", {
 	Suffix = "s",
 	Rounding = 2,
 })
-autoDefenseDepBox:AddSlider("ReactionDelaySeconds", {
-	Text = "Reaction Delay",
-	Min = 0,
-	Max = 1,
-	Default = 0,
-	Suffix = "s",
-	Rounding = 2,
-	Tooltip = "Delay before auto-defense inputs.",
-})
-autoDefenseDepBox:AddDropdown("DefenseProfile", {
-	Text = "Defense Profile",
-	Values = { "Max Survival", "Balanced", "Low Noise" },
-	Default = NO_HITBOX_PROFILE_DEFAULT,
-})
-autoDefenseDepBox:AddSlider("NoHitboxMinConfidence", {
-	Text = "No-Hitbox Min Confidence",
-	Min = 0,
-	Max = 6,
-	Default = 2.0,
-	Rounding = 2,
-})
-autoDefenseDepBox:AddSlider("NoHitboxReactionBiasMs", {
-	Text = "No-Hitbox Reaction Bias",
-	Min = -150,
-	Max = 150,
-	Default = -35,
-	Suffix = "ms",
-	Rounding = 0,
-})
-autoDefenseDepBox:AddSlider("NoHitboxSkillPollMs", {
-	Text = "No-Hitbox Skill Poll",
-	Min = 10,
-	Max = 200,
-	Default = 30,
-	Suffix = "ms",
-	Rounding = 0,
-})
-autoDefenseDepBox:AddSlider("NoHitboxPartPollMs", {
-	Text = "No-Hitbox Part Poll",
-	Min = 10,
-	Max = 250,
-	Default = 40,
-	Suffix = "ms",
-	Rounding = 0,
-})
-autoDefenseDepBox:AddSlider("NoHitboxMinBlockSeconds", {
-	Text = "No-Hitbox Min Block",
-	Min = 0.05,
-	Max = 2.0,
-	Default = 0.35,
-	Suffix = "s",
-	Rounding = 2,
-})
 autoDefenseDepBox:SetupDependencies({
 	{ autoDefenseToggle, true },
 })
-
-local function enforceNoHitboxToggles()
-	if not NO_HITBOX_ONLY then
-		return
-	end
-	if ignoreHitboxToggle and ignoreHitboxToggle.Value ~= true then
-		ignoreHitboxToggle:SetValue(true)
-	end
-	if ignoreM1HitboxToggle and ignoreM1HitboxToggle.Value ~= true then
-		ignoreM1HitboxToggle:SetValue(true)
-	end
-end
-
-ignoreHitboxToggle:OnChanged(function(value)
-	if NO_HITBOX_ONLY and value ~= true then
-		task.defer(enforceNoHitboxToggles)
-	end
-end)
-
-ignoreM1HitboxToggle:OnChanged(function(value)
-	if NO_HITBOX_ONLY and value ~= true then
-		task.defer(enforceNoHitboxToggles)
-	end
-end)
-
-task.defer(enforceNoHitboxToggles)
 
 local m1TradeTab = window:AddTab("M1 Auto Trade")
 local m1TradeGroup = m1TradeTab:AddLeftGroupbox("M1 Auto Trade")
@@ -27484,7 +27138,9 @@ refreshProfiles(nil)
 refreshStepList(nil)
 loadStepToEditor(nil)
 end
+end
 
+do
 local autoCounterTab = window:AddTab("Auto-Counter")
 local autoCounterGroup = autoCounterTab:AddLeftGroupbox("Keybind Press")
 autoCounterGroup:AddDropdown("AutoCounterKey", {
@@ -27698,10 +27354,7 @@ Library:Toggle()
 
 AttributeListener.init()
 Defense.init()
-local Players = game:GetService("Players")
-local Configuration = require("Utility/Configuration")
 local UsingSkillWatcher = require("Features/Combat/UsingSkillWatcher")
-local InputClient = require("Game/InputClient")
 local M1AutoTrade = require("Features/Combat/M1AutoTrade")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 M1AutoTrade.init()
@@ -27852,108 +27505,6 @@ local function classifyEffectCategory(args)
 	return "Other"
 end
 
-local effectListCache = {
-	Whitelist = { raw = nil, set = {} },
-	Blacklist = { raw = nil, set = {} },
-}
-
-local function normalizeEffectName(name)
-	return string.lower(tostring(name or ""))
-end
-
-local function parseEffectList(raw)
-	local set = {}
-	if type(raw) ~= "string" then
-		return set
-	end
-	for token in string.gmatch(raw, "[^,]+") do
-		local cleaned = string.lower((token:gsub("^%s+", ""):gsub("%s+$", "")))
-		if cleaned ~= "" then
-			set[cleaned] = true
-		end
-	end
-	return set
-end
-
-local function getEffectList(kind)
-	local cache = effectListCache[kind]
-	if not cache then
-		return {}
-	end
-	local optKey = kind == "Whitelist" and "EffectSignalWhitelist" or "EffectSignalBlacklist"
-	local raw = Options and Options[optKey] and Options[optKey].Value or ""
-	if cache.raw ~= raw then
-		cache.raw = raw
-		cache.set = parseEffectList(raw)
-	end
-	return cache.set or {}
-end
-
-local function findEffectActors(args)
-	local localPlayer = Players.LocalPlayer
-	local localChar = localPlayer and localPlayer.Character
-	local attacker = nil
-	local localTarget = false
-
-	for i = 1, args.n do
-		local value = args[i]
-		if typeof(value) == "Instance" then
-			local model = value:IsA("Model") and value or value:FindFirstAncestorWhichIsA("Model")
-			if model then
-				if localChar and (model == localChar or model:IsDescendantOf(localChar)) then
-					localTarget = true
-				elseif not attacker then
-					attacker = model
-				end
-			end
-		end
-	end
-
-	if attacker and localPlayer and Players:GetPlayerFromCharacter(attacker) == localPlayer then
-		attacker = nil
-	end
-
-	return attacker, localTarget
-end
-
-local EffectDefender = require("Features/Combat/Objects/Defender")
-
-local function recordEffectSignal(...)
-	if not Configuration.expectToggleValue("UseEffectSignals") then
-		return
-	end
-
-	local args = table.pack(...)
-	local effectName = tostring(args[1] or "Unknown")
-	local attacker, localTarget = findEffectActors(args)
-	if not attacker then
-		return
-	end
-
-	local mode = Options and Options["EffectSignalMode"] and Options["EffectSignalMode"].Value or "TargetOnly"
-	local effectKey = normalizeEffectName(effectName)
-
-	if mode == "TargetOnly" then
-		if not localTarget then
-			return
-		end
-	elseif mode == "Whitelist" then
-		local whitelist = getEffectList("Whitelist")
-		if not whitelist[effectKey] then
-			return
-		end
-	elseif mode == "AllExceptBlacklist" then
-		local blacklist = getEffectList("Blacklist")
-		if blacklist[effectKey] then
-			return
-		end
-	end
-
-	if EffectDefender and EffectDefender.recordSignal then
-		EffectDefender.recordSignal(attacker, "Effect", effectName)
-	end
-end
-
 local function logEffect(source, ...)
 	if not Configuration.expectToggleValue("LogEffects") then
 		return
@@ -27985,26 +27536,22 @@ end
 do
 	local effect = ReplicatedStorage:WaitForChild("Effect")
 	effect.OnClientEvent:Connect(function(...)
-		recordEffectSignal(...)
 		logEffect("Effect", ...)
 	end)
 
 	local effectReliable = ReplicatedStorage:WaitForChild("EffectReliable")
 	effectReliable.OnClientEvent:Connect(function(...)
-		recordEffectSignal(...)
 		logEffect("EffectReliable", ...)
 	end)
 
 	local pEffect = ReplicatedStorage:WaitForChild("PEffect")
 	pEffect.OnClientEvent:Connect(function(...)
-		recordEffectSignal(...)
 		logEffect("PEffect", ...)
 	end)
 
 	local effectBindable = ReplicatedStorage:WaitForChild("EffectBindable")
 	if effectBindable and effectBindable.Event then
 		effectBindable.Event:Connect(function(...)
-			recordEffectSignal(...)
 			logEffect("EffectBindable", ...)
 		end)
 	end
@@ -28014,7 +27561,6 @@ do
 		local prev = resolveEffectReturnsCallback(effectReturns)
 		if prev then
 			effectReturns.OnClientInvoke = function(...)
-				recordEffectSignal(...)
 				logEffect("EffectReturns", ...)
 				return prev(...)
 			end
@@ -28471,15 +28017,11 @@ executeDefensiveAction = function(def, rule, actionFn)
 	local result = actionFn()
 	local afterBlock = defenseActionState.blockIssued or 0
 	local afterDash = defenseActionState.dashAttempt or 0
-	local needsFallback = false
-	if afterBlock <= beforeBlock then
-		needsFallback = true
-	end
-	if afterDash > beforeDash and defenseActionState.dashOk == false then
-		needsFallback = true
-	end
-	if needsFallback then
-		local minBlock = (rule and rule.minBlockSeconds) or Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+
+	local minBlock = (rule and rule.minBlockSeconds) or NO_HITBOX_MIN_BLOCK_SECONDS
+	local needsBlockFallback = (afterBlock <= beforeBlock)
+		or (afterDash > beforeDash and defenseActionState.dashOk == false)
+	if needsBlockFallback then
 		blockFor(math.max(minBlock, 0.05))
 	end
 	return result
@@ -28505,11 +28047,7 @@ local function trackSignalWindow(def, key, rule, delaySeconds, windowSeconds, in
 		local defenderModule = require("Features/Combat/Objects/Defender")
 		local baseDelay = type(defenderModule) == "table" and type(defenderModule.rdelay) == "function" and defenderModule.rdelay()
 			or 0
-		local biasMs = Configuration.expectOptionValue("NoHitboxReactionBiasMs")
-		if type(biasMs) ~= "number" then
-			biasMs = -35
-		end
-		extraDelay = math.clamp(math.max(0, baseDelay + (biasMs / 1000)), 0, 0.06)
+		extraDelay = math.clamp(math.max(0, baseDelay + NO_HITBOX_REACTION_BIAS_SECONDS), 0, 0.06)
 	end
 	local delayWithPing = delay + extraDelay
 	task.delay(delayWithPing, LPH_NO_VIRTUALIZE(function()
@@ -28541,31 +28079,22 @@ local function trackSignalWindow(def, key, rule, delaySeconds, windowSeconds, in
 	return true
 end
 
-local function partHitboxMatches(part, hitbox, shape, offset)
-	local localCharacter = LocalPlayer and LocalPlayer.Character
-	if not part or not localCharacter then
-		return false
+local function getWorkspaceService()
+	if workspaceService then
+		return workspaceService
 	end
-
-	local timing = {
-		shape = shape,
-		hitbox = hitbox,
-		offset = offset or Vector3.zero,
-		fhb = true,
-		duih = false,
-	}
-
-	local options = HitboxOptions.new(part, timing, { localCharacter })
-	options.spredict = true
-	options.ptime = predictionSeconds()
-	options.entity = part
-
-	return hitboxDefender:hc(options, nil)
+	local ok, resolved = pcall(game.GetService, game, "Workspace")
+	if ok and resolved then
+		workspaceService = resolved
+		return resolved
+	end
+	return workspace
 end
 
 local function iterGenkiCgaBrown()
 	local results = {}
-	local thrown = workspaceService:FindFirstChild("Thrown")
+	local ws = getWorkspaceService()
+	local thrown = ws and ws:FindFirstChild("Thrown")
 	if thrown then
 		for _, child in ipairs(thrown:GetChildren()) do
 			if child:IsA("BasePart") and child.Name == "Genki" then
@@ -28578,7 +28107,7 @@ local function iterGenkiCgaBrown()
 	if #results > 0 then
 		return results
 	end
-	local fallback = workspaceService:FindFirstChild("Genki", true)
+	local fallback = ws and ws:FindFirstChild("Genki", true)
 	if fallback and fallback:IsA("BasePart") then
 		if fallback.BrickColor and fallback.BrickColor.Name == "CGA brown" then
 			results[#results + 1] = fallback
@@ -28599,11 +28128,7 @@ local BABYLON_M1_TRIGGER_COUNT = 5
 local BABYLON_MULTIPLE_THRESHOLD = 2
 
 local function noHitboxPartPollSeconds()
-	local ms = Configuration.expectOptionValue("NoHitboxPartPollMs")
-	if type(ms) ~= "number" then
-		ms = 40
-	end
-	return math.max(0.01, ms / 1000)
+	return NO_HITBOX_PART_POLL_SECONDS
 end
 
 local function localRootPart()
@@ -28727,7 +28252,8 @@ end
 
 local function countBabylonGates()
 	local count = 0
-	local thrown = workspaceService:FindFirstChild("Thrown")
+	local ws = getWorkspaceService()
+	local thrown = ws and ws:FindFirstChild("Thrown")
 	if thrown then
 		for _, child in ipairs(thrown:GetChildren()) do
 			if child:IsA("BasePart") and safeLower(child.Name) == "babylongate" then
@@ -28856,12 +28382,22 @@ local function startPartPulse()
 			if not Configuration.expectToggleValue("EnableAutoDefense") then
 				continue
 			end
-			local thrown = workspaceService:FindFirstChild("Thrown")
-			if thrown then
-				for _, child in ipairs(thrown:GetChildren()) do
-					handleBabylonGatePart(child)
-					handleBallPart(child)
-					handleCutPastelBlueGreen(child)
+			local ok, err = pcall(function()
+				local ws = getWorkspaceService()
+				local thrown = ws and ws:FindFirstChild("Thrown")
+				if thrown then
+					for _, child in ipairs(thrown:GetChildren()) do
+						handleBabylonGatePart(child)
+						handleBallPart(child)
+						handleCutPastelBlueGreen(child)
+					end
+				end
+			end)
+			if not ok then
+				if Logger and Logger.warn then
+					Logger.warn("Part pulse tick failed: %s", tostring(err))
+				else
+					warn(string.format("[PartPulse] tick failed: %s", tostring(err)))
 				end
 			end
 		end
@@ -28876,7 +28412,7 @@ blockFor = function(seconds)
 	end
 	local hold = seconds or 0
 	if hold <= 0 then
-		hold = Configuration.expectOptionValue("NoHitboxMinBlockSeconds") or 0.35
+		hold = NO_HITBOX_MIN_BLOCK_SECONDS
 	end
 	defenseActionState.blockIssued = (defenseActionState.blockIssued or 0) + 1
 	return UsingSkillWatcher.blockHoldSeconds(hold)
@@ -29927,6 +29463,7 @@ UsingSkillWatcher.setRules({
 })
 UsingSkillWatcher.init()
 startPartPulse()
+end
 
 local function standDistanceMeters(model)
 	if not model or not model:IsA("Model") then
@@ -29947,142 +29484,117 @@ local function standDistanceMeters(model)
 	return (root.Position - localRoot.Position).Magnitude
 end
 
-local standLogLast = {}
-local STAND_LOG_COOLDOWN = 0.35
-local standsFolderRef = nil
 local standOwnerCache = {}
+standOwnerCache.logLast = standOwnerCache.logLast or {}
+standOwnerCache.logCooldown = standOwnerCache.logCooldown or 0.35
 
-local function shouldLogStand(key)
+function standOwnerCache.shouldLogStand(key)
 	local now = os.clock()
-	local last = standLogLast[key]
-	if last and now - last < STAND_LOG_COOLDOWN then
+	local last = standOwnerCache.logLast[key]
+	if last and now - last < standOwnerCache.logCooldown then
 		return false
 	end
-	standLogLast[key] = now
+	standOwnerCache.logLast[key] = now
 	return true
 end
 
-local function scanStandAnimations()
-	if not standsFolderRef or not standsFolderRef.Parent then
-		standsFolderRef = workspace:FindFirstChild("Stands")
-	end
-	local standsFolder = standsFolderRef
-	local live = workspace:FindFirstChild("Live")
+standOwnerCache.standM1FallbackTiming = standOwnerCache.standM1FallbackTiming or {
+	tag = "M1",
+	actions = {
+		_data = {
+			{ _type = "Start Block" },
+			{ _type = "End Block", _when = 300 },
+		},
+	},
+}
 
-	local localStand = nil
-	if Players.LocalPlayer and Players.LocalPlayer.Character then
-		local standValue = Players.LocalPlayer.Character:FindFirstChild("STANDOBJ")
-		if standValue and standValue.Value and standValue.Value:IsA("Model") then
-			localStand = standValue.Value
-		end
+function standOwnerCache.resolveStandOwnerForScan(live, standModel)
+	local cached = standOwnerCache[standModel]
+	if cached and cached.Parent then
+		return cached
 	end
-	local logStand = Configuration.expectToggleValue("LogStandAnimations")
-	local logAll = Configuration.expectToggleValue("LogAllAnimations")
-	local logLocal = Configuration.expectToggleValue("LogLocalStandAnimations")
-	local autoDefense = Configuration.expectToggleValue("EnableAutoDefense")
-	local m1Trade = Configuration.expectToggleValue("EnableM1AutoTrade")
-
-	if not (logStand or logAll or logLocal or autoDefense or m1Trade) then
-		return
-	end
-
-	local function resolveStandOwner(standModel)
-		local cached = standOwnerCache[standModel]
-		if cached and cached.Parent then
-			return cached
-		end
-		standOwnerCache[standModel] = nil
-		if not live then
-			return nil
-		end
-		for _, entity in next, live:GetChildren() do
-			local standValue = entity:FindFirstChild("STANDOBJ")
-			if standValue and standValue.Value == standModel then
-				standOwnerCache[standModel] = entity
-				return entity
-			end
-		end
+	standOwnerCache[standModel] = nil
+	if not live then
 		return nil
 	end
-
-	local standM1FallbackTiming = {
-		tag = "M1",
-		actions = {
-			_data = {
-				{ _type = "Start Block" },
-				{ _type = "End Block", _when = 300 },
-			},
-		},
-	}
-
-	local function resolveStandTiming(fullId, track)
-		if not SaveManager.as then
-			return nil
+	for _, entity in next, live:GetChildren() do
+		local standValue = entity:FindFirstChild("STANDOBJ")
+		if standValue and standValue.Value == standModel then
+			standOwnerCache[standModel] = entity
+			return entity
 		end
-		local timing = SaveManager.as:index(fullId)
+	end
+	return nil
+end
+
+function standOwnerCache.resolveStandTimingForScan(fullId, track)
+	local timingStore = SaveManager.as
+	if not timingStore then
+		return nil
+	end
+	local timing = timingStore:index(fullId)
+	if timing then
+		return timing
+	end
+	local trackName = track and track.Name
+	if trackName and trackName ~= "" then
+		timing = timingStore:find(trackName)
 		if timing then
 			return timing
 		end
-		local trackName = track and track.Name
-		if trackName and trackName ~= "" then
-			timing = SaveManager.as:find(trackName)
-			if timing then
-				return timing
-			end
-		end
-		local animName = track and track.Animation and track.Animation.Name
-		if animName and animName ~= "" then
-			timing = SaveManager.as:find(animName)
-			if timing then
-				return timing
-			end
-		end
-		return nil
 	end
+	local animName = track and track.Animation and track.Animation.Name
+	if animName and animName ~= "" then
+		return timingStore:find(animName)
+	end
+	return nil
+end
 
-	local function isLikelyM1Name(name)
-		local lowered = string.lower(tostring(name or ""))
-		if lowered == "" then
-			return false
-		end
-		if lowered == "m1" then
-			return true
-		end
-		if
-			lowered:find("m1_")
-			or lowered:find("_m1")
-			or lowered:find(" m1")
-			or lowered:find("m1 ")
-			or lowered:find("-m1")
-			or lowered:find("m1-")
-		then
-			return true
-		end
-		if lowered:find("light") or lowered:find("basic") or lowered:find("jab") then
-			return true
-		end
+function standOwnerCache.standAnimIsLikelyM1(name)
+	local lowered = string.lower(tostring(name or ""))
+	if lowered == "" then
 		return false
 	end
-
-	local function isLikelyStandM1(track, timing)
-		if timing and timing.tag == "M1" then
-			return true
-		end
-		if timing and isLikelyM1Name(timing.name) then
-			return true
-		end
-		local trackName = track and track.Name
-		if isLikelyM1Name(trackName) then
-			return true
-		end
-		local animName = track and track.Animation and track.Animation.Name
-		if isLikelyM1Name(animName) then
-			return true
-		end
-		return false
+	if lowered == "m1" then
+		return true
 	end
+	if
+		lowered:find("m1_")
+		or lowered:find("_m1")
+		or lowered:find(" m1")
+		or lowered:find("m1 ")
+		or lowered:find("-m1")
+		or lowered:find("m1-")
+	then
+		return true
+	end
+	if lowered:find("light") or lowered:find("basic") or lowered:find("jab") then
+		return true
+	end
+	return false
+end
 
+function standOwnerCache.isLikelyStandM1ForScan(track, timing)
+	if timing and timing.tag == "M1" then
+		return true
+	end
+	if timing and standOwnerCache.standAnimIsLikelyM1(timing.name) then
+		return true
+	end
+	local trackName = track and track.Name
+	if standOwnerCache.standAnimIsLikelyM1(trackName) then
+		return true
+	end
+	local animName = track and track.Animation and track.Animation.Name
+	if standOwnerCache.standAnimIsLikelyM1(animName) then
+		return true
+	end
+	return false
+end
+
+function standOwnerCache.collectStandModelsForScan(standsFolder, live, localStand)
 	local standModels = {}
+
 	local function addStandModel(standModel)
 		if standModel and standModel:IsA("Model") then
 			standModels[standModel] = true
@@ -30111,97 +29623,129 @@ local function scanStandAnimations()
 		addStandModel(localStand)
 	end
 
-	local function processTracks(standModel, tracks)
-		if not standModel then
-			return
-		end
-		if not tracks then
-			return
-		end
-		local owner = resolveStandOwner(standModel)
-		local ownerName = owner and owner.Name or standModel.Name
-		local ownerDistance = owner and standDistanceMeters(owner) or standDistanceMeters(standModel)
-		for _, track in next, tracks do
-			if not track then
-				continue
-			end
-			local aid = (track.Animation and track.Animation.AnimationId) or track.AnimationId
-			local aidStr = tostring(aid or "")
-			if aidStr == "" then
-				continue
-			end
-			local numericId = aidStr:match("%d+")
-			local fullId = numericId and ("rbxassetid://" .. numericId) or aidStr
-			local timing = resolveStandTiming(fullId, track)
-			if autoDefense and _G.isBlacklistedM1 and _G.isBlacklistedM1(fullId) then
-				InputClient.blockHoldSeconds(0.3)
-			end
-			-- Stand-driven animations can still trigger M1 trade / logging here.
-			if m1Trade then
-				if timing and timing.tag == "M1" then
-					M1AutoTrade.handleEntity(timing, owner or standModel, ownerDistance)
-				elseif isLikelyStandM1(track, timing) then
-					M1AutoTrade.handleEntity(standM1FallbackTiming, owner or standModel, ownerDistance)
-				end
-			end
-			if logStand or logAll or (logLocal and localStand and standModel == localStand) then
-				local key = standModel:GetFullName() .. "|" .. fullId
-				if shouldLogStand(key) then
-					local distance = ownerDistance
-					if timing then
-						Library:AddExistAnimEntry(ownerName, distance, timing)
-					else
-						Library:AddMissEntry("Stand Anim", fullId, ownerName, distance, "Stand")
-					end
-				end
-			end
-		end
+	return standModels
+end
+
+function standOwnerCache.processStandTracksForScan(standModel, tracks, live, localStand, flags)
+	if not standModel or not tracks then
+		return
 	end
 
-	local seenModels = {}
-	local function scanModel(standModel)
-		if not standModel or seenModels[standModel] then
-			return
-		end
-		seenModels[standModel] = true
-		for _, desc in next, standModel:GetDescendants() do
-			if desc:IsA("Animator") then
-				processTracks(standModel, desc:GetPlayingAnimationTracks())
-			elseif desc:IsA("Humanoid") then
-				local animator = desc:FindFirstChildOfClass("Animator")
-				if animator then
-					processTracks(standModel, animator:GetPlayingAnimationTracks())
-				end
-			elseif desc:IsA("AnimationController") then
-				processTracks(standModel, desc:GetPlayingAnimationTracks())
-			end
-		end
-	end
+	local owner = standOwnerCache.resolveStandOwnerForScan(live, standModel)
+	local ownerName = owner and owner.Name or standModel.Name
+	local ownerDistance = owner and standDistanceMeters(owner) or standDistanceMeters(standModel)
 
-	for standModel in next, standModels do
-		if localStand and standModel == localStand then
-			if logLocal or logAll or autoDefense or m1Trade then
-				scanModel(standModel)
+	for _, track in next, tracks do
+		if not track then
+			continue
+		end
+		local aid = (track.Animation and track.Animation.AnimationId) or track.AnimationId
+		local aidStr = tostring(aid or "")
+		if aidStr == "" then
+			continue
+		end
+		local numericId = aidStr:match("%d+")
+		local fullId = numericId and ("rbxassetid://" .. numericId) or aidStr
+		local timing = standOwnerCache.resolveStandTimingForScan(fullId, track)
+
+		if flags.m1Trade then
+			if timing and timing.tag == "M1" then
+				M1AutoTrade.handleEntity(timing, owner or standModel, ownerDistance)
+			elseif standOwnerCache.isLikelyStandM1ForScan(track, timing) then
+				M1AutoTrade.handleEntity(standOwnerCache.standM1FallbackTiming, owner or standModel, ownerDistance)
 			end
-		else
-			if logStand or logAll or autoDefense or m1Trade then
-				scanModel(standModel)
+		end
+
+		if flags.logStand or flags.logAll or (flags.logLocal and localStand and standModel == localStand) then
+			local key = standModel:GetFullName() .. "|" .. fullId
+			if standOwnerCache.shouldLogStand(key) then
+				local distance = ownerDistance
+				if timing then
+					Library:AddExistAnimEntry(ownerName, distance, timing)
+				else
+					Library:AddMissEntry("Stand Anim", fullId, ownerName, distance, "Stand")
+				end
 			end
 		end
 	end
 end
 
+function standOwnerCache.scanStandModelForScan(standModel, live, localStand, flags)
+	if not standModel then
+		return
+	end
+	for _, desc in next, standModel:GetDescendants() do
+		if desc:IsA("Animator") then
+			standOwnerCache.processStandTracksForScan(standModel, desc:GetPlayingAnimationTracks(), live, localStand, flags)
+		elseif desc:IsA("Humanoid") then
+			local animator = desc:FindFirstChildOfClass("Animator")
+			if animator then
+				standOwnerCache.processStandTracksForScan(
+					standModel,
+					animator:GetPlayingAnimationTracks(),
+					live,
+					localStand,
+					flags
+				)
+			end
+		elseif desc:IsA("AnimationController") then
+			standOwnerCache.processStandTracksForScan(standModel, desc:GetPlayingAnimationTracks(), live, localStand, flags)
+		end
+	end
+end
+
+function standOwnerCache.shouldProcessStandModelForScan(standModel, localStand, flags)
+	if localStand and standModel == localStand then
+		return flags.logLocal or flags.logAll or flags.m1Trade
+	end
+	return flags.logStand or flags.logAll or flags.m1Trade
+end
+
+standOwnerCache.scanStandAnimations = function()
+	if not standOwnerCache.standsFolderRef or not standOwnerCache.standsFolderRef.Parent then
+		standOwnerCache.standsFolderRef = workspace:FindFirstChild("Stands")
+	end
+	local standsFolder = standOwnerCache.standsFolderRef
+	local live = workspace:FindFirstChild("Live")
+
+	local localStand = nil
+	if Players.LocalPlayer and Players.LocalPlayer.Character then
+		local standValue = Players.LocalPlayer.Character:FindFirstChild("STANDOBJ")
+		if standValue and standValue.Value and standValue.Value:IsA("Model") then
+			localStand = standValue.Value
+		end
+	end
+	local logStand = Configuration.expectToggleValue("LogStandAnimations")
+	local logAll = Configuration.expectToggleValue("LogAllAnimations")
+	local logLocal = Configuration.expectToggleValue("LogLocalStandAnimations")
+	local m1Trade = Configuration.expectToggleValue("EnableM1AutoTrade")
+
+	if not (logStand or logAll or logLocal or m1Trade) then
+		return
+	end
+
+	local flags = {
+		logStand = logStand,
+		logAll = logAll,
+		logLocal = logLocal,
+		m1Trade = m1Trade,
+	}
+	local standModels = standOwnerCache.collectStandModelsForScan(standsFolder, live, localStand)
+	for standModel in next, standModels do
+		if standOwnerCache.shouldProcessStandModelForScan(standModel, localStand, flags) then
+			standOwnerCache.scanStandModelForScan(standModel, live, localStand, flags)
+		end
+	end
+end
+
 do
-	local runService = game:GetService("RunService")
-	local stepSignal = runService.PostSimulation or runService.Heartbeat
-	stepSignal:Connect(LPH_NO_VIRTUALIZE(function()
+	(game:GetService("RunService").PostSimulation or game:GetService("RunService").Heartbeat):Connect(LPH_NO_VIRTUALIZE(function()
 		if Configuration.expectToggleValue("LogAllAnimations")
 			or Configuration.expectToggleValue("LogStandAnimations")
 			or Configuration.expectToggleValue("LogLocalStandAnimations")
-			or Configuration.expectToggleValue("EnableAutoDefense")
 			or Configuration.expectToggleValue("EnableM1AutoTrade")
 		then
-			scanStandAnimations()
+			standOwnerCache.scanStandAnimations()
 		end
 	end))
 end
